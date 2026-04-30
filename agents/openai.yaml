@@ -1,0 +1,4 @@
+interface:
+  display_name: "Multi-Shot Review"
+  short_description: "Loop Codex CLI reviews for large diffs"
+  default_prompt: "Use $multi-shot-review after making a large project change."
