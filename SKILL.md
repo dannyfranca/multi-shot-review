@@ -10,22 +10,38 @@ Use this after substantial code changes, especially broad refactors, contract ch
 ## Workflow
 
 1. Inspect the changed scope and choose `--uncommitted`, `--base <branch>`, or `--commit <sha>`.
-2. Run four `codex exec review` processes directly. Do not use subagents.
-3. Use `--ephemeral` so review runs do not persist live history. Use `-o <file>` for each final review result.
-4. Validate each finding against the actual code and task intent. Fix valid issues. Ignore unsuitable, irrelevant, duplicate, or low-value findings.
-5. Add or update focused regression tests when they materially reduce risk.
-6. Run the relevant tests or checks.
-7. Run the four-review pass again after fixes. Repeat until every review is quiet, or a full pass produces only findings that are ignored and no action is taken.
+2. From the repo being reviewed, run this skill's `scripts/new-review-dir.py` once to create and print the review artifact base path.
+3. Run four `codex exec review` processes directly. Do not use subagents.
+4. Use `--ephemeral` so review runs do not persist live history. Use `-o <file>` for each final review result.
+5. Validate each finding against the actual code and task intent. Fix valid issues. Ignore unsuitable, irrelevant, duplicate, or low-value findings.
+6. Add or update focused regression tests when they materially reduce risk.
+7. Run the relevant tests or checks.
+8. Run the four-review pass again after fixes. Repeat until every review is quiet, or a full pass produces only findings that are ignored and no action is taken.
+
+## Review Artifacts
+
+Keep review artifacts under the base path printed by `scripts/new-review-dir.py`. The script creates `.review/<timestamp-random>/` in the repo being reviewed, using a directory-friendly UTC ISO timestamp with millisecond precision plus a random suffix.
+
+Name outputs by pass and run number:
+
+```text
+$REVIEW_DIR/1-1.json
+$REVIEW_DIR/1-2.json
+$REVIEW_DIR/1-3.json
+$REVIEW_DIR/1-4.json
+$REVIEW_DIR/2-1.json
+```
+
+The first number is the review pass; the second is the independent run in that pass. Do not commit `.review/`.
 
 ## CLI Shape
 
-Prefer this pattern, adjusting target and filenames:
-
 ```bash
-codex exec review --ephemeral --uncommitted -o .review/review-1.json
+REVIEW_DIR="$(python3 /path/to/this-skill/scripts/new-review-dir.py)"
+codex exec review --ephemeral --uncommitted -o "$REVIEW_DIR/1-1.json"
 ```
 
-Run four independent instances with different output files.
+Run four independent instances for each pass with different output files: `1-1.json` through `1-4.json`, then `2-1.json` through `2-4.json`, and so on.
 
 ## Guardrails
 
