@@ -79,3 +79,4 @@ EOF
 - Do not treat review output as authoritative. Verify every input before editing.
 - Do not keep iterating when the latest full pass caused no code or test changes.
 - Keep fixes scoped to validated review findings and the user’s requested change.
+- Only spawn reviews for the changes you have made, ignoring reviews for unrelated changes.
