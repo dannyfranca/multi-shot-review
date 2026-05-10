@@ -76,6 +76,7 @@ EOF
 
 ## Guardrails
 
+- MUST re-run any review even if it finds only one issue solved. MUST not assume a follow up run would not return anything.
 - Do not treat review output as authoritative. Verify every input before editing.
 - Do not keep iterating when the latest full pass caused no code or test changes.
 - Keep fixes scoped to validated review findings and the user’s requested change.
