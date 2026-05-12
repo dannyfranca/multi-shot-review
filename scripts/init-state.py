@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper for init-state.py."""
+"""Initialize a state-managed review directory and print its path."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--root",
-        type=Path,
         default=".",
+        type=Path,
         help="Execution path where .review should be created. Defaults to the current directory.",
     )
     args = parser.parse_args()
