@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper for init-state.py."""
+"""Compatibility wrapper for init_state.py."""
 
 from __future__ import annotations
 

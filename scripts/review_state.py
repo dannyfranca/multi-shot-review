@@ -981,7 +981,7 @@ def add_slice_from_args(args: argparse.Namespace, *, stdin: Any = sys.stdin) -> 
 
 def parse_report_ignored_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Report ignored findings for a finding run. Completes the slice only when all findings are ignored."
+        description="Report how many findings were ignored for a finding run; state rules decide the next step."
     )
     parser.add_argument("--review-dir", required=True, type=Path)
     parser.add_argument("--count", required=True, type=int, help="Number of findings from the run that were ignored.")

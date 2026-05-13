@@ -658,17 +658,17 @@ class CliTests(unittest.TestCase):
         )
 
     def test_help_outputs(self) -> None:
-        for script in ("init-state.py", "add-slice.py", "run-reviews.py", "report-ignored-findings.py"):
+        for script in ("init_state.py", "add_slice.py", "run_reviews.py", "report_ignored_findings.py"):
             proc = self.run_cli(str(SCRIPTS / script), "--help")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("usage:", proc.stdout)
 
     def test_cli_paths_with_spaces_and_outside_skill_dir(self) -> None:
-        init = self.run_cli(str(SCRIPTS / "init-state.py"), "--root", str(self.root), cwd=Path(self.tmp.name))
+        init = self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root), cwd=Path(self.tmp.name))
         self.assertEqual(init.returncode, 0, init.stderr)
         review_dir = Path(init.stdout.strip())
         add = self.run_cli(
-            str(SCRIPTS / "add-slice.py"),
+            str(SCRIPTS / "add_slice.py"),
             "--review-dir",
             str(review_dir),
             "--name",
@@ -682,13 +682,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(Path(state.data["slices"]["api"]["cwd"]), self.root.resolve())
 
     def test_compatibility_wrapper_creates_state(self) -> None:
-        proc = self.run_cli(str(SCRIPTS / "new-review-dir.py"), "--root", str(self.root))
+        proc = self.run_cli(str(SCRIPTS / "new_review_dir.py"), "--root", str(self.root))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue((Path(proc.stdout.strip()) / "_state.json").exists())
 
     def test_cli_clear_errors_for_missing_state_and_invalid_args(self) -> None:
         missing = self.run_cli(
-            str(SCRIPTS / "add-slice.py"),
+            str(SCRIPTS / "add_slice.py"),
             "--review-dir",
             str(self.root / ".review" / "missing"),
             "--name",
@@ -699,10 +699,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("missing review state", missing.stderr)
 
         review_dir = Path(
-            self.run_cli(str(SCRIPTS / "init-state.py"), "--root", str(self.root)).stdout.strip()
+            self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root)).stdout.strip()
         )
         invalid = self.run_cli(
-            str(SCRIPTS / "add-slice.py"),
+            str(SCRIPTS / "add_slice.py"),
             "--review-dir",
             str(review_dir),
             "--name",
@@ -716,12 +716,12 @@ class CliTests(unittest.TestCase):
 
         bad_review_dir = self.root / "not-a-review-dir"
         bad_review_dir.write_text("", encoding="utf-8")
-        for script in ("run-reviews.py", "report-ignored-findings.py"):
+        for script in ("run_reviews.py", "report_ignored_findings.py"):
             proc = self.run_cli(
                 str(SCRIPTS / script),
                 "--review-dir",
                 str(bad_review_dir),
-                *([] if script == "run-reviews.py" else ["--count", "1"]),
+                *([] if script == "run_reviews.py" else ["--count", "1"]),
             )
             self.assertEqual(proc.returncode, 2)
             self.assertIn("error:", proc.stderr)
@@ -731,7 +731,7 @@ class CliTests(unittest.TestCase):
         root_file = Path(self.tmp.name) / "not-a-directory"
         root_file.write_text("", encoding="utf-8")
 
-        for script in ("init-state.py", "new-review-dir.py"):
+        for script in ("init_state.py", "new_review_dir.py"):
             proc = self.run_cli(str(SCRIPTS / script), "--root", str(root_file), cwd=Path(self.tmp.name))
             self.assertEqual(proc.returncode, 2)
             self.assertIn("error:", proc.stderr)
@@ -739,7 +739,7 @@ class CliTests(unittest.TestCase):
 
     def test_report_ignored_findings_cli_completes_slice(self) -> None:
         review_dir = Path(
-            self.run_cli(str(SCRIPTS / "init-state.py"), "--root", str(self.root)).stdout.strip()
+            self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root)).stdout.strip()
         )
         with ReviewState.locked(review_dir) as state:
             state.add_slice(
@@ -761,7 +761,7 @@ class CliTests(unittest.TestCase):
             state.save()
 
         proc = self.run_cli(
-            str(SCRIPTS / "report-ignored-findings.py"),
+            str(SCRIPTS / "report_ignored_findings.py"),
             "--review-dir",
             str(review_dir),
             "--slice",
@@ -775,12 +775,12 @@ class CliTests(unittest.TestCase):
 
     def test_concurrent_add_slice_cli_has_no_lost_updates(self) -> None:
         review_dir = Path(
-            self.run_cli(str(SCRIPTS / "init-state.py"), "--root", str(self.root)).stdout.strip()
+            self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root)).stdout.strip()
         )
         commands = [
             [
                 sys.executable,
-                str(SCRIPTS / "add-slice.py"),
+                str(SCRIPTS / "add_slice.py"),
                 "--review-dir",
                 str(review_dir),
                 "--name",
@@ -805,10 +805,10 @@ class CliTests(unittest.TestCase):
 
     def test_concurrent_run_reviews_cli_with_fake_codex_has_no_duplicate_reservations(self) -> None:
         review_dir = Path(
-            self.run_cli(str(SCRIPTS / "init-state.py"), "--root", str(self.root)).stdout.strip()
+            self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root)).stdout.strip()
         )
         add = self.run_cli(
-            str(SCRIPTS / "add-slice.py"),
+            str(SCRIPTS / "add_slice.py"),
             "--review-dir",
             str(review_dir),
             "--name",
@@ -839,7 +839,7 @@ class CliTests(unittest.TestCase):
         }
         cmd = [
             sys.executable,
-            str(SCRIPTS / "run-reviews.py"),
+            str(SCRIPTS / "run_reviews.py"),
             "--review-dir",
             str(review_dir),
         ]
@@ -860,11 +860,11 @@ class CliTests(unittest.TestCase):
 
     def test_prompt_file_stdin_cli_passes_prompt_to_fake_codex(self) -> None:
         review_dir = Path(
-            self.run_cli(str(SCRIPTS / "init-state.py"), "--root", str(self.root)).stdout.strip()
+            self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root)).stdout.strip()
         )
         prompt = "Review the current uncommitted changes.\nSlice: API only.\n"
         add = self.run_cli(
-            str(SCRIPTS / "add-slice.py"),
+            str(SCRIPTS / "add_slice.py"),
             "--review-dir",
             str(review_dir),
             "--name",
@@ -896,7 +896,7 @@ class CliTests(unittest.TestCase):
             "CAPTURED_PROMPT": str(captured_prompt),
         }
         proc = subprocess.run(
-            [sys.executable, str(SCRIPTS / "run-reviews.py"), "--review-dir", str(review_dir)],
+            [sys.executable, str(SCRIPTS / "run_reviews.py"), "--review-dir", str(review_dir)],
             cwd=self.root,
             env=env,
             text=True,
