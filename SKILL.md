@@ -13,7 +13,7 @@ Use this after substantial code changes, especially broad refactors, contract ch
 2. Initialize review state once from the repo being reviewed:
 
 ```bash
-REVIEW_DIR="$(python3 /path/to/this-skill/scripts/init-state.py)"
+REVIEW_DIR="$(python3 /path/to/this-skill/scripts/init_state.py)"
 ```
 
 3. Register review slices. Use broad native slices for small changes and focused prompted slices for larger or riskier changes.
@@ -21,13 +21,13 @@ REVIEW_DIR="$(python3 /path/to/this-skill/scripts/init-state.py)"
 Broad uncommitted slice:
 
 ```bash
-python3 /path/to/this-skill/scripts/add-slice.py --review-dir "$REVIEW_DIR" --name broad-1 --uncommitted
+python3 /path/to/this-skill/scripts/add_slice.py --review-dir "$REVIEW_DIR" --name broad-1 --uncommitted
 ```
 
 Prompted focused slice:
 
 ```bash
-python3 /path/to/this-skill/scripts/add-slice.py --review-dir "$REVIEW_DIR" --name api-contracts --prompt-file - <<'EOF'
+python3 /path/to/this-skill/scripts/add_slice.py --review-dir "$REVIEW_DIR" --name api-contracts --prompt-file - <<'EOF'
 Review the current uncommitted changes.
 Slice: API and data-contract changes only.
 Scope: <exact features, directories, files, or contracts in this slice>.
@@ -39,7 +39,7 @@ EOF
 Structure slice:
 
 ```bash
-python3 /path/to/this-skill/scripts/add-slice.py --review-dir "$REVIEW_DIR" --name structure --prompt-file - <<'EOF'
+python3 /path/to/this-skill/scripts/add_slice.py --review-dir "$REVIEW_DIR" --name structure --prompt-file - <<'EOF'
 Review the current uncommitted changes.
 Slice: project structure and maintainability.
 Read /path/to/this-skill/references/software-structure.md and apply those guidelines.
@@ -50,19 +50,19 @@ EOF
 4. Run the state-managed review pass:
 
 ```bash
-python3 /path/to/this-skill/scripts/run-reviews.py --review-dir "$REVIEW_DIR"
+python3 /path/to/this-skill/scripts/run_reviews.py --review-dir "$REVIEW_DIR"
 ```
 
 5. Read each produced review file. Validate every finding against the actual code and task intent.
 6. Fix only real, relevant findings. Add focused regression tests when they materially reduce risk.
-7. If a slice's latest run has findings and every finding in that run is ignored, report the ignored count so the slice can complete without an infinite follow-up loop:
+7. If a slice's latest run has findings and you ignore one or more findings from that run, report the ignored count. The script decides whether that count completes the slice or leaves a follow-up run required:
 
 ```bash
-python3 /path/to/this-skill/scripts/report-ignored-findings.py --review-dir "$REVIEW_DIR" --slice api-contracts --count 2
+python3 /path/to/this-skill/scripts/report_ignored_findings.py --review-dir "$REVIEW_DIR" --slice api-contracts --count 2
 ```
 
 8. Run the relevant tests or checks.
-9. Call `run-reviews.py` again after fixes or ignored-finding reports. Keep calling it until it prints `done`.
+9. Call `run_reviews.py` again after fixes or ignored-finding reports. Keep calling it until it prints `done`.
 
 ## Slice Selection
 
@@ -75,8 +75,8 @@ python3 /path/to/this-skill/scripts/report-ignored-findings.py --review-dir "$RE
 ## Guardrails
 
 - The scripts own state, locking, output names, retry behavior, and deciding whether another pass is needed.
-- Do not manually skip follow-up passes when `run-reviews.py` says `call again`.
-- Use `report-ignored-findings.py` only when all findings from that slice run were ignored. If any finding was fixed, let the next review pass run.
+- Do not manually skip follow-up passes when `run_reviews.py` says `call again`.
+- Call `report_ignored_findings.py` with the number of findings ignored from the latest slice run. Do not infer completion from that number; let the script and the next `run_reviews.py` call decide.
 - Do not treat review output as authoritative. Verify every finding before editing.
 - Do not keep iterating when the latest full pass caused no code or test changes.
 - Keep fixes scoped to validated review findings and the user’s requested change.
