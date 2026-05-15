@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -201,6 +202,13 @@ class Reservation:
     pass_number: int
     output_file: Path
     slice_data: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ReviewExecution:
+    reservation: Reservation
+    proc: subprocess.CompletedProcess[str]
+    launch_error: OSError | None = None
 
 
 class LockedReviewState(AbstractContextManager["ReviewState"]):
@@ -809,6 +817,25 @@ def default_runner(
     )
 
 
+def run_reserved_review(
+    reservation: Reservation,
+    command_runner: Runner,
+) -> ReviewExecution:
+    cmd, input_text = build_review_command(reservation.slice_data, reservation.output_file)
+    try:
+        proc = command_runner(
+            cmd,
+            Path(reservation.slice_data["cwd"]),
+            input_text,
+            reservation.output_file,
+            reservation.slice_data,
+        )
+    except OSError as exc:
+        proc = subprocess.CompletedProcess(cmd, 1, "", str(exc))
+        return ReviewExecution(reservation=reservation, proc=proc, launch_error=exc)
+    return ReviewExecution(reservation=reservation, proc=proc)
+
+
 def evaluate_completed_process(
     review_dir: Path,
     reservation: Reservation,
@@ -876,44 +903,46 @@ def run_reviews(
             print("waiting: no review slices have been registered. add slices, then call again.", file=stdout)
         return 0
 
-    for reservation in reservations:
-        cmd, input_text = build_review_command(reservation.slice_data, reservation.output_file)
-        try:
-            proc = command_runner(
-                cmd,
-                Path(reservation.slice_data["cwd"]),
-                input_text,
-                reservation.output_file,
-                reservation.slice_data,
+    state_completed = False
+    with ThreadPoolExecutor(max_workers=len(reservations)) as executor:
+        futures = [executor.submit(run_reserved_review, reservation, command_runner) for reservation in reservations]
+        for future in as_completed(futures):
+            execution = future.result()
+            reservation = execution.reservation
+            proc = execution.proc
+            if execution.launch_error is not None:
+                exc = execution.launch_error
+                append_error(
+                    review_dir,
+                    f"failed to launch review for {reservation.slice_name}",
+                    f"Slice: {reservation.slice_name}\nOutput: {reservation.output_file}\nError: {exc}",
+                )
+                status, classification, finding_count, error = (
+                    "failed",
+                    None,
+                    None,
+                    f"review command failed to launch: {exc}",
+                )
+            else:
+                status, classification, finding_count, error = evaluate_completed_process(review_dir, reservation, proc)
+            with ReviewState.locked(review_dir) as state:
+                completion_applied = state.complete_run(
+                    run_id=reservation.run_id,
+                    slice_name=reservation.slice_name,
+                    status=status,
+                    exit_code=proc.returncode,
+                    classification=classification,
+                    finding_count=finding_count,
+                    error=error,
+                )
+                state.save()
+                state_completed = state.data["completed"]
+            display_status = status if completion_applied else "skipped-late-completion"
+            print(
+                f"{reservation.slice_name}: pass {reservation.pass_number} {display_status} -> {reservation.output_file}",
+                file=stdout,
+                flush=True,
             )
-        except OSError as exc:
-            append_error(
-                review_dir,
-                f"failed to launch review for {reservation.slice_name}",
-                f"Slice: {reservation.slice_name}\nOutput: {reservation.output_file}\nError: {exc}",
-            )
-            proc = subprocess.CompletedProcess(cmd, 1, "", str(exc))
-            status, classification, finding_count, error = "failed", None, None, f"review command failed to launch: {exc}"
-        else:
-            status, classification, finding_count, error = evaluate_completed_process(review_dir, reservation, proc)
-        with ReviewState.locked(review_dir) as state:
-            completion_applied = state.complete_run(
-                run_id=reservation.run_id,
-                slice_name=reservation.slice_name,
-                status=status,
-                exit_code=proc.returncode,
-                classification=classification,
-                finding_count=finding_count,
-                error=error,
-            )
-            state.save()
-            state_completed = state.data["completed"]
-        display_status = status if completion_applied else "skipped-late-completion"
-        print(
-            f"{reservation.slice_name}: pass {reservation.pass_number} {display_status} -> {reservation.output_file}",
-            file=stdout,
-            flush=True,
-        )
 
     if state_completed:
         print("done: all review slices are complete; no further review runs are needed.", file=stdout)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one pass for each currently eligible review slice."""
+"""Run one parallel pass for each currently eligible review slice."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from review_state import ReviewStateError, run_reviews
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run eligible review slices once and update review state.")
+    parser = argparse.ArgumentParser(description="Run eligible review slices in parallel once and update review state.")
     parser.add_argument("--review-dir", required=True, type=Path)
     args = parser.parse_args()
     try:

@@ -321,6 +321,28 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(state.data["slices"]["failed"]["next_pass"], 1)
         self.assertTrue((self.review_dir / "_errors.md").exists())
 
+    def test_eligible_slices_run_in_parallel_within_one_invocation(self) -> None:
+        for name in ("api", "tests", "ui"):
+            self.add_slice(name)
+
+        barrier = threading.Barrier(3)
+        started = []
+        lock = threading.Lock()
+
+        def runner(cmd, cwd, input_text, output_file, slice_data):
+            with lock:
+                started.append(slice_data["name"])
+            barrier.wait(timeout=2)
+            output_file.write_text("No findings.", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        run_reviews(self.review_dir, command_runner=runner, stdout=io.StringIO())
+
+        self.assertEqual(set(started), {"api", "tests", "ui"})
+        state = ReviewState.load(self.review_dir)
+        self.assertTrue(state.data["completed"])
+        self.assertTrue(all(item["complete"] for item in state.data["slices"].values()))
+
     def test_failed_output_is_retryable_without_overwriting_prior_file(self) -> None:
         self.add_slice("api")
 
