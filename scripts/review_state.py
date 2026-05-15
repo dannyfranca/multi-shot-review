@@ -29,7 +29,8 @@ PRIORITY_RE = re.compile(r"\[(?:P[0-3])\]", re.IGNORECASE)
 REVIEW_COMMENT_RE = re.compile(r"Review comment:", re.IGNORECASE)
 FULL_REVIEW_COMMENTS_RE = re.compile(r"^Full review comments:\s*(.*)", re.IGNORECASE | re.DOTALL | re.MULTILINE)
 QUIET_RE = re.compile(
-    r"\b(no actionable issues|no blocking issues|no findings|no issues found|did not find\b.*\b(?:bug|issue|problem|defect)s?|lgtm|looks good to me)\b",
+    r"\b(no actionable issues|no blocking issues|no findings|no issues found|did not find\b.*\b(?:bug|issue|problem|defect)s?|lgtm|looks good to me)\b"
+    r"|(?=[\s\S]*\b(?:is|are|remains?|looks?) consistent with\b)(?=[\s\S]*\b(?:tests?|typechecks?|checks?)\b[\w\s/-]*\bpassed\b)",
     re.IGNORECASE,
 )
 CONTRAST_RE = re.compile(r"\b(but|however|except|although)\b", re.IGNORECASE)

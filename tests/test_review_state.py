@@ -202,6 +202,14 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(classify_output("No [P1] or [P2] findings remain."), "quiet")
         self.assertEqual(classify_output("I did not find any [P1] issues."), "quiet")
         self.assertEqual(classify_output("No findings above [P2]."), "quiet")
+        self.assertEqual(
+            classify_output(
+                "The cashier generated client signatures, required company/auth headers, discriminated Pix response "
+                "handling, status polling, and query invalidations are consistent with the Mobile BFF cashier contract "
+                "and existing generated client style. Targeted typecheck and cashier tests passed."
+            ),
+            "quiet",
+        )
         self.assertEqual(classify_output("No [P1] findings, but [P2] retry can loop forever"), "findings")
         self.assertEqual(
             classify_output("I did not find any API bugs, but the retry loop can run forever"),
