@@ -53,9 +53,12 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def filename_timestamp() -> str:
+    return now_iso().replace(":", "-")
+
+
 def session_id() -> str:
-    timestamp = now_iso().replace(":", "-")
-    return f"{timestamp}-{secrets.token_hex(4)}"
+    return f"{filename_timestamp()}-{secrets.token_hex(4)}"
 
 
 def parse_iso(value: str) -> datetime | None:
@@ -703,13 +706,12 @@ class ReviewState:
             self.data["last_error"] = None
 
     def _next_output_file(self, pass_number: int, name: str, runs: Iterable[dict[str, Any]]) -> Path:
-        base = self.review_dir / f"{pass_number}-{name}.md"
         used = {str(run.get("output_file")) for run in runs}
-        if str(base) not in used and not base.exists():
-            return base
-        attempt = 2
+        attempt = sum(1 for run in runs if run.get("pass") == pass_number) + 1
+        timestamp = filename_timestamp()
         while True:
-            candidate = self.review_dir / f"{pass_number}-{name}-retry{attempt}.md"
+            retry_suffix = "" if attempt == 1 else f"-retry{attempt}"
+            candidate = self.review_dir / f"{timestamp}-{pass_number}-{name}{retry_suffix}.md"
             if str(candidate) not in used and not candidate.exists():
                 return candidate
             attempt += 1

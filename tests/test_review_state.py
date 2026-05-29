@@ -16,6 +16,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+TIMESTAMPED_REVIEW_FILE_RE = (
+    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z-"
+    r"\d+-[a-z0-9._-]+(?:-retry\d+)?\.md$"
+)
 sys.path.insert(0, str(SCRIPTS))
 
 from review_state import (  # noqa: E402
@@ -279,7 +283,10 @@ class RunnerTests(unittest.TestCase):
 
         state = ReviewState.load(self.review_dir)
         self.assertTrue(state.data["slices"]["api"]["complete"])
-        self.assertTrue((self.review_dir / "1-api.md").exists())
+        self.assertRegex(
+            _single_review_file(self.review_dir, "*-1-api.md").name,
+            TIMESTAMPED_REVIEW_FILE_RE,
+        )
         self.assertIn("done:", out.getvalue())
 
     def test_finding_slice_advances_pass_number(self) -> None:
@@ -299,12 +306,12 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(state.data["slices"]["api"]["complete"])
         self.assertEqual(state.data["slices"]["api"]["next_pass"], 2)
         self.assertEqual(state.data["slices"]["api"]["runs"][0]["finding_count"], 1)
-        self.assertTrue((self.review_dir / "1-api.md").exists())
+        self.assertTrue(_single_review_file(self.review_dir, "*-1-api.md").exists())
 
         run_reviews(self.review_dir, command_runner=runner, stdout=io.StringIO())
         state = ReviewState.load(self.review_dir)
         self.assertTrue(state.data["slices"]["api"]["complete"])
-        self.assertTrue((self.review_dir / "2-api.md").exists())
+        self.assertTrue(_single_review_file(self.review_dir, "*-2-api.md").exists())
 
     def test_mixed_quiet_finding_and_failed_slices_update_independently(self) -> None:
         for name in ("quiet", "finding", "failed"):
@@ -365,8 +372,11 @@ class RunnerTests(unittest.TestCase):
         run_reviews(self.review_dir, command_runner=fail_then_quiet, stdout=io.StringIO())
         run_reviews(self.review_dir, command_runner=fail_then_quiet, stdout=io.StringIO())
 
-        self.assertEqual((self.review_dir / "1-api.md").read_text(encoding="utf-8"), "partial stderr context")
-        self.assertTrue((self.review_dir / "1-api-retry2.md").exists())
+        self.assertEqual(
+            _single_review_file(self.review_dir, "*-1-api.md").read_text(encoding="utf-8"),
+            "partial stderr context",
+        )
+        self.assertTrue(_single_review_file(self.review_dir, "*-1-api-retry2.md").exists())
         self.assertTrue(ReviewState.load(self.review_dir).data["slices"]["api"]["complete"])
 
     def test_launch_failure_records_error_and_remains_retryable(self) -> None:
@@ -457,7 +467,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runs[0]["status"], "failed")
         self.assertIn("stale running", runs[0]["error"])
         self.assertEqual(runs[1]["status"], "quiet")
-        self.assertTrue((self.review_dir / "1-api-retry2.md").exists())
+        self.assertTrue(_single_review_file(self.review_dir, "*-1-api-retry2.md").exists())
         self.assertTrue(state.data["slices"]["api"]["complete"])
 
     def test_reused_pid_running_reservation_is_recovered(self) -> None:
@@ -525,6 +535,73 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(state.data["slices"]["api"]["runs"]), 1)
         self.assertEqual(state.data["slices"]["ui"]["runs"][0]["status"], "running")
 
+    def test_slice_added_mid_batch_starts_at_pass_one_while_existing_followups_continue(self) -> None:
+        self.add_slice("api")
+        self.add_slice("ui")
+        for _ in range(4):
+            with ReviewState.locked(self.review_dir) as state:
+                reservations = state.reserve_eligible()
+                for reservation in reservations:
+                    state.complete_run(
+                        run_id=reservation.run_id,
+                        slice_name=reservation.slice_name,
+                        status="findings",
+                        exit_code=0,
+                        classification="findings",
+                        finding_count=1,
+                    )
+                state.save()
+
+        with ReviewState.locked(self.review_dir) as state:
+            reservations = state.reserve_eligible()
+            self.assertEqual(
+                {reservation.slice_name: reservation.pass_number for reservation in reservations},
+                {"api": 5, "ui": 5},
+            )
+            api = next(reservation for reservation in reservations if reservation.slice_name == "api")
+            ui = next(reservation for reservation in reservations if reservation.slice_name == "ui")
+            state.complete_run(
+                run_id=api.run_id,
+                slice_name="api",
+                status="findings",
+                exit_code=0,
+                classification="findings",
+                finding_count=1,
+            )
+            state.add_slice(
+                name="docs",
+                mode="native",
+                target={"uncommitted": True},
+                prompt=None,
+                cwd=self.root,
+            )
+            followups = state.reserve_eligible()
+            state.save()
+
+        self.assertEqual(followups, [])
+        state = ReviewState.load(self.review_dir)
+        self.assertEqual(state.data["slices"]["api"]["next_pass"], 6)
+        self.assertEqual(state.data["slices"]["docs"]["next_pass"], 1)
+        self.assertEqual(state.data["slices"]["docs"]["runs"], [])
+        self.assertEqual(state.data["slices"]["ui"]["runs"][-1]["status"], "running")
+
+        with ReviewState.locked(self.review_dir) as state:
+            state.complete_run(
+                run_id=ui.run_id,
+                slice_name="ui",
+                status="quiet",
+                exit_code=0,
+                classification="quiet",
+                finding_count=0,
+            )
+            followups = state.reserve_eligible()
+            state.save()
+
+        self.assertEqual(
+            {reservation.slice_name: reservation.pass_number for reservation in followups},
+            {"api": 6, "docs": 1},
+        )
+
     def test_uncertain_success_logs_diagnostic_and_completes(self) -> None:
         self.add_slice("api")
         run_reviews(self.review_dir, command_runner=_writes("Inspected the changes."), stdout=io.StringIO())
@@ -554,8 +631,8 @@ class RunnerTests(unittest.TestCase):
         state = ReviewState.load(self.review_dir)
         self.assertEqual(state.data["slices"]["empty"]["runs"][1]["status"], "quiet")
         self.assertEqual(state.data["slices"]["missing"]["runs"][1]["status"], "quiet")
-        self.assertTrue((self.review_dir / "1-empty-retry2.md").exists())
-        self.assertTrue((self.review_dir / "1-missing-retry2.md").exists())
+        self.assertTrue(_single_review_file(self.review_dir, "*-1-empty-retry2.md").exists())
+        self.assertTrue(_single_review_file(self.review_dir, "*-1-missing-retry2.md").exists())
 
     def test_terminal_recovery_clears_session_last_error(self) -> None:
         self.add_slice("api")
@@ -604,7 +681,9 @@ class RunnerTests(unittest.TestCase):
         def runner(cmd, cwd, input_text, output_file, slice_data):
             self.assertEqual(cwd, self.root)
             self.assertIsNone(input_text)
-            self.assertEqual(output_file, self.review_dir / "1-api.md")
+            self.assertEqual(output_file.parent, self.review_dir)
+            self.assertRegex(output_file.name, TIMESTAMPED_REVIEW_FILE_RE)
+            self.assertTrue(output_file.name.endswith("-1-api.md"))
             self.assertEqual(slice_data["target"], {"uncommitted": True})
             self.assertEqual(cmd[:4], ["codex", "exec", "review", "--ephemeral"])
             self.assertIn("-m", cmd)
@@ -952,6 +1031,15 @@ def _writes(text: str):
 
 def _should_not_run(cmd, cwd, input_text, output_file, slice_data):
     raise AssertionError("runner should not be invoked")
+
+
+def _single_review_file(review_dir: Path, pattern: str) -> Path:
+    files = sorted(review_dir.glob(pattern))
+    if len(files) != 1:
+        raise AssertionError(
+            f"expected exactly one file matching {pattern!r}, got {[path.name for path in files]}"
+        )
+    return files[0]
 
 
 if __name__ == "__main__":
