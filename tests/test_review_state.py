@@ -17,9 +17,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 TIMESTAMPED_REVIEW_FILE_RE = (
-    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z-"
+    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z-"
     r"\d+-[a-z0-9._-]+(?:-retry\d+)?\.md$"
 )
+TIMESTAMPED_REVIEW_DIR_RE = r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z-[0-9a-f]{8}$"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_state import (  # noqa: E402
@@ -46,6 +47,7 @@ class ReviewStateTests(unittest.TestCase):
     def test_init_creates_loadable_state(self) -> None:
         state_path = self.review_dir / "_state.json"
         self.assertTrue(state_path.exists())
+        self.assertRegex(self.review_dir.name, TIMESTAMPED_REVIEW_DIR_RE)
         state = ReviewState.load(self.review_dir)
         self.assertEqual(state.data["schema_version"], 1)
         self.assertEqual(state.data["slices"], {})
