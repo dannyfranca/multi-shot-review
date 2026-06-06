@@ -360,6 +360,73 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(state.data["completed"])
         self.assertTrue(all(item["complete"] for item in state.data["slices"].values()))
 
+    def test_run_reviews_waits_for_slowest_parallel_slice_before_returning(self) -> None:
+        self.add_slice("fast")
+        self.add_slice("slow")
+
+        fast_started = threading.Event()
+        slow_started = threading.Event()
+        fast_finished = threading.Event()
+        slow_can_finish = threading.Event()
+        returned = threading.Event()
+        errors = []
+        results = []
+
+        def runner(cmd, cwd, input_text, output_file, slice_data):
+            name = slice_data["name"]
+            if name == "fast":
+                fast_started.set()
+                if not slow_started.wait(timeout=2):
+                    raise AssertionError("slow slice did not start before fast slice finished")
+                output_file.write_text("No findings.", encoding="utf-8")
+                fast_finished.set()
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            slow_started.set()
+            if not slow_can_finish.wait(timeout=2):
+                raise AssertionError("slow slice was not released")
+            output_file.write_text("No findings.", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        def invoke() -> None:
+            try:
+                results.append(run_reviews(self.review_dir, command_runner=runner, stdout=io.StringIO()))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                returned.set()
+
+        thread = threading.Thread(target=invoke)
+        thread.start()
+        try:
+            self.assertTrue(fast_started.wait(timeout=2))
+            self.assertTrue(slow_started.wait(timeout=2))
+            self.assertTrue(fast_finished.wait(timeout=2))
+
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if errors:
+                    raise errors[0]
+                state = ReviewState.load(self.review_dir)
+                fast_status = state.data["slices"]["fast"]["runs"][0]["status"]
+                slow_status = state.data["slices"]["slow"]["runs"][0]["status"]
+                if fast_status == "quiet" and slow_status == "running":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("fast slice was not completed while slow slice remained running")
+
+            self.assertFalse(returned.is_set())
+            slow_can_finish.set()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            if errors:
+                raise errors[0]
+            self.assertEqual(results, [0])
+        finally:
+            slow_can_finish.set()
+            thread.join(timeout=2)
+
     def test_failed_output_is_retryable_without_overwriting_prior_file(self) -> None:
         self.add_slice("api")
 
