@@ -13,10 +13,24 @@ Use this after substantial code changes, especially broad refactors, contract ch
 2. Initialize review state once from the repo being reviewed:
 
 ```bash
-REVIEW_DIR="$(python3 /path/to/this-skill/scripts/init_state.py)"
+REVIEW_DIR="$(python3 /path/to/this-skill/scripts/init_state.py --task-file - <<'EOF'
+<original user request>
+EOF
+)"
 ```
 
-3. Register review slices. Use broad native slices for small changes and focused prompted slices for larger or riskier changes.
+3. Add related/future tasks when part of the requested work is intentionally deferred. These tasks give reviewers context so they do not flag planned follow-up work as a false positive:
+
+```bash
+python3 /path/to/this-skill/scripts/add_related_task.py \
+  --review-dir "$REVIEW_DIR" \
+  --name follow-up-name \
+  --text "Describe the related task that will be addressed later."
+```
+
+For larger related tasks, use `--file <path>` or `--dir <path>` instead of `--text`.
+
+4. Register review slices. Use broad native slices for small changes and focused prompted slices for larger or riskier changes. Reviewers automatically receive the session task context from `$REVIEW_DIR/task.md`; slice prompts should only describe slice-specific scope.
 
 Broad uncommitted slice:
 
@@ -47,22 +61,22 @@ Focus on colocation, file sizing, naming, reuse boundaries, state modeling, and 
 EOF
 ```
 
-4. Run the state-managed review pass:
+5. Run the state-managed review pass:
 
 ```bash
 python3 /path/to/this-skill/scripts/run_reviews.py --review-dir "$REVIEW_DIR"
 ```
 
-5. Read each produced review file. Validate every finding against the actual code and task intent.
-6. Fix only real, relevant findings. Add focused regression tests when they materially reduce risk.
-7. If a slice's latest run has findings and you ignore one or more findings from that run, report the ignored count. The script decides whether that count completes the slice or leaves a follow-up run required:
+6. Read each produced review file. Validate every finding against the actual code and task intent.
+7. Fix only real, relevant findings. Add focused regression tests when they materially reduce risk.
+8. If a slice's latest run has findings and you ignore one or more findings from that run, report the ignored count. The script decides whether that count completes the slice or leaves a follow-up run required:
 
 ```bash
 python3 /path/to/this-skill/scripts/report_ignored_findings.py --review-dir "$REVIEW_DIR" --slice api-contracts --count 2
 ```
 
-8. Run the relevant tests or checks.
-9. Call `run_reviews.py` again after fixes or ignored-finding reports. Keep calling it until it prints `done`.
+9. Run the relevant tests or checks.
+10. Call `run_reviews.py` again after fixes or ignored-finding reports. Keep calling it until it prints `done`.
 
 ## Slice Selection
 
@@ -76,6 +90,7 @@ python3 /path/to/this-skill/scripts/report_ignored_findings.py --review-dir "$RE
 
 - The scripts own state, locking, output names, retry behavior, and deciding whether another pass is needed.
 - Do not manually skip follow-up passes when `run_reviews.py` says `call again`.
+- Do not manually edit task-context paths in prompts. Initialize with the original user request and use `add_related_task.py`; the runner attaches `$REVIEW_DIR/task.md` consistently.
 - Call `report_ignored_findings.py` with the number of findings ignored from the latest slice run. Do not infer completion from that number; let the script and the next `run_reviews.py` call decide.
 - Do not treat review output as authoritative. Verify every finding before editing.
 - Do not keep iterating when the latest full pass caused no code or test changes.
