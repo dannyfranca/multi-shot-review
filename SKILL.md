@@ -9,52 +9,39 @@ Use this after substantial code changes, especially broad refactors, contract ch
 
 ## Workflow
 
-1. Inspect the changed scope and choose `--uncommitted`, `--base <branch>`, or `--commit <sha>`.
-2. From the repo being reviewed, run this skill's `scripts/new-review-dir.py` once to create and print the review artifact base path.
-3. Decide the review round shape:
-    - Small changes: run 2 broad instances for up to 5 meaningful files, 3 for 6-10, and 4 for 11-20. Mechanical refactor churn does not need to increase the count.
-    - Bigger changes: skip broad generic reviewers. Slice the diff by feature, contract, subsystem, or risk area, and run one focused reviewer per slice. Do not treat 4 as a limit.
-    - Add cross-cutting slices when useful: project structure, API/data contracts, migrations, tests/edge cases, performance, security, or UI flows.
-4. Use `--ephemeral` so review runs do not persist live history. Use `-o <file>` for each final review result.
-5. Pin reviews to a strong model with high reasoning. Do not use mini or fast/spark models for review passes.
-6. Validate each finding against the actual code and task intent. Fix valid issues. Ignore unsuitable, irrelevant, duplicate, or low-value findings.
-7. Add or update focused regression tests when they materially reduce risk.
-8. Run the relevant tests or checks.
-9. Run another pass after fixes. Keep valuable slices, drop quiet or low-signal slices, and repeat until every review is quiet or the latest full pass produces only ignored findings.
-
-## Review Artifacts
-
-Keep review artifacts under the base path printed by `scripts/new-review-dir.py`. The script creates `.review/<timestamp-random>/` in the repo being reviewed, using a directory-friendly UTC ISO timestamp with millisecond precision plus a random suffix.
-
-Name outputs by pass and run number or slice:
-
-```text
-$REVIEW_DIR/1-1.md
-$REVIEW_DIR/1-2.md
-$REVIEW_DIR/1-3.md
-$REVIEW_DIR/1-4.md
-$REVIEW_DIR/1-api-contracts.md
-$REVIEW_DIR/1-structure.md
-$REVIEW_DIR/2-1.md
-```
-
-The first number is the review pass. Use a run number for broad reviewers and a short slice name for focused reviewers. Do not commit `.review/`.
-
-## CLI Shape
-
-Broad small-change review:
+1. Inspect only the changes you are responsible for reviewing. Ignore unrelated user changes.
+2. Initialize review state once from the repo being reviewed:
 
 ```bash
-REVIEW_DIR="$(python3 /path/to/this-skill/scripts/new-review-dir.py)"
-codex exec review --ephemeral -m gpt-5.5 -c 'model_reasoning_effort="high"' --uncommitted -o "$REVIEW_DIR/1-1.md"
+REVIEW_DIR="$(python3 /path/to/this-skill/scripts/init_state.py --task-file - <<'EOF'
+<original user request>
+EOF
+)"
 ```
 
-Run independent instances with different output files: `1-1.md`, `1-2.md`, then `2-1.md`, `2-2.md`, and so on.
-
-Sliced big-change review. Custom prompts cannot be combined with `--uncommitted`, `--base`, or `--commit`, so put the diff target and slice scope in the prompt text. For base or commit targets, replace the first prompt line with `Review changes against <branch>.` or `Review changes introduced by <sha>.`
+3. Add related/future tasks when part of the requested work is intentionally deferred. These tasks give reviewers context so they do not flag planned follow-up work as a false positive:
 
 ```bash
-codex exec review --ephemeral -m gpt-5.5 -c 'model_reasoning_effort="high"' -o "$REVIEW_DIR/1-api-contracts.md" - <<'EOF'
+python3 /path/to/this-skill/scripts/add_related_task.py \
+  --review-dir "$REVIEW_DIR" \
+  --name follow-up-name \
+  --text "Describe the related task that will be addressed later."
+```
+
+For larger related tasks, use `--file <path>` or `--dir <path>` instead of `--text`.
+
+4. Register review slices. Use broad native slices for small changes and focused prompted slices for larger or riskier changes. Reviewers automatically receive the session task context from `$REVIEW_DIR/task.md`; slice prompts should only describe slice-specific scope.
+
+Broad uncommitted slice:
+
+```bash
+python3 /path/to/this-skill/scripts/add_slice.py --review-dir "$REVIEW_DIR" --name broad-1 --uncommitted
+```
+
+Prompted focused slice:
+
+```bash
+python3 /path/to/this-skill/scripts/add_slice.py --review-dir "$REVIEW_DIR" --name api-contracts --prompt-file - <<'EOF'
 Review the current uncommitted changes.
 Slice: API and data-contract changes only.
 Scope: <exact features, directories, files, or contracts in this slice>.
@@ -66,7 +53,7 @@ EOF
 Structure slice:
 
 ```bash
-codex exec review --ephemeral -m gpt-5.5 -c 'model_reasoning_effort="high"' -o "$REVIEW_DIR/1-structure.md" - <<'EOF'
+python3 /path/to/this-skill/scripts/add_slice.py --review-dir "$REVIEW_DIR" --name structure --prompt-file - <<'EOF'
 Review the current uncommitted changes.
 Slice: project structure and maintainability.
 Read /path/to/this-skill/references/software-structure.md and apply those guidelines.
@@ -74,10 +61,38 @@ Focus on colocation, file sizing, naming, reuse boundaries, state modeling, and 
 EOF
 ```
 
+5. Run the state-managed review pass:
+
+```bash
+python3 /path/to/this-skill/scripts/run_reviews.py --review-dir "$REVIEW_DIR"
+```
+
+6. Read each produced review file. Validate every finding against the actual code and task intent.
+7. Fix only real, relevant findings. Add focused regression tests when they materially reduce risk.
+8. If a slice's latest run has findings and you ignore one or more findings from that run, report the ignored count. The script decides whether that count completes the slice or leaves a follow-up run required:
+
+```bash
+python3 /path/to/this-skill/scripts/report_ignored_findings.py --review-dir "$REVIEW_DIR" --slice api-contracts --count 2
+```
+
+9. Run the relevant tests or checks.
+10. Call `run_reviews.py` again after fixes or ignored-finding reports. Keep calling it until it prints `done`.
+
+## Slice Selection
+
+- Small changes: add 2 broad slices for up to 5 meaningful files, 3 for 6-10, and 4 for 11-20. Mechanical refactor churn does not need to increase the count.
+- Bigger changes: prefer focused slices by feature, contract, subsystem, or risk area. Do not treat 4 as a limit.
+- Add cross-cutting slices when useful: project structure, API/data contracts, migrations, tests/edge cases, performance, security, or UI flows.
+- For native slices, use `--base <branch>` or `--commit <sha>` instead of `--uncommitted` when that is the correct review target.
+- For prompted slices, put the target in the prompt text, such as `Review changes against main.` or `Review changes introduced by <sha>.`
+
 ## Guardrails
 
-- MUST re-run any review even if it finds only one issue solved. MUST not assume a follow up run would not return anything.
-- Do not treat review output as authoritative. Verify every input before editing.
+- The scripts own state, locking, output names, retry behavior, and deciding whether another pass is needed.
+- Do not manually skip follow-up passes when `run_reviews.py` says `call again`.
+- Do not manually edit task-context paths in prompts. Initialize with the original user request and use `add_related_task.py`; the runner attaches `$REVIEW_DIR/task.md` consistently.
+- Call `report_ignored_findings.py` with the number of findings ignored from the latest slice run. Do not infer completion from that number; let the script and the next `run_reviews.py` call decide.
+- Do not treat review output as authoritative. Verify every finding before editing.
 - Do not keep iterating when the latest full pass caused no code or test changes.
 - Keep fixes scoped to validated review findings and the user’s requested change.
-- Only spawn reviews for the changes you have made, ignoring reviews for unrelated changes.
+- Do not commit `.review/`.
