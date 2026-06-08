@@ -12,6 +12,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,9 +24,11 @@ TIMESTAMPED_REVIEW_FILE_RE = (
 TIMESTAMPED_REVIEW_DIR_RE = r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z-[0-9a-f]{8}$"
 sys.path.insert(0, str(SCRIPTS))
 
+import review_state as review_state_module  # noqa: E402
 from review_state import (  # noqa: E402
     ReviewState,
     ReviewStateError,
+    add_related_task,
     build_review_command,
     classify_output,
     count_findings,
@@ -39,7 +42,7 @@ class ReviewStateTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "repo"
         self.root.mkdir()
-        self.review_dir = init_review_state(self.root)
+        self.review_dir = init_review_state(self.root, "Implement the requested API change.")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -52,6 +55,167 @@ class ReviewStateTests(unittest.TestCase):
         self.assertEqual(state.data["schema_version"], 1)
         self.assertEqual(state.data["slices"], {})
         self.assertFalse(state.data["completed"])
+        task_text = (self.review_dir / "task.md").read_text(encoding="utf-8")
+        self.assertIn("Implement the requested API change.", task_text)
+        self.assertIn("No related/future tasks registered.", task_text)
+        self.assertTrue((self.review_dir / "related-tasks").is_dir())
+
+    def test_init_rejects_empty_task(self) -> None:
+        with self.assertRaises(ReviewStateError):
+            init_review_state(self.root, "  ")
+
+    def test_related_tasks_update_task_entrypoint_from_text_file_and_directory(self) -> None:
+        add_related_task(
+            self.review_dir,
+            "follow-up",
+            text="Address the broader reporting workflow later.",
+            file=None,
+            directory=None,
+        )
+        self.assertEqual(
+            (self.review_dir / "related-tasks" / "follow-up.md").read_text(encoding="utf-8"),
+            "Address the broader reporting workflow later.",
+        )
+        task_text = (self.review_dir / "task.md").read_text(encoding="utf-8")
+        self.assertIn("[follow-up](related-tasks/follow-up.md)", task_text)
+        self.assertIn("Implement the requested API change.", task_text)
+
+        source_file = self.root / "later.md"
+        source_file.write_text("Tighten the generated docs in a follow-up.", encoding="utf-8")
+        add_related_task(self.review_dir, "docs", text=None, file=source_file, directory=None)
+        self.assertEqual(
+            (self.review_dir / "related-tasks" / "docs.md").read_text(encoding="utf-8"),
+            "Tighten the generated docs in a follow-up.",
+        )
+
+        source_dir = self.root / "future-work"
+        source_dir.mkdir()
+        (source_dir / "README.md").write_text("Future workflow notes.", encoding="utf-8")
+        add_related_task(self.review_dir, "workflow", text=None, file=None, directory=source_dir)
+        self.assertEqual(
+            (self.review_dir / "related-tasks" / "workflow" / "README.md").read_text(encoding="utf-8"),
+            "Future workflow notes.",
+        )
+        task_text = (self.review_dir / "task.md").read_text(encoding="utf-8")
+        self.assertIn("[docs](related-tasks/docs.md)", task_text)
+        self.assertIn("[workflow](related-tasks/workflow/)", task_text)
+
+    def test_related_task_overwrite_switches_between_file_and_directory(self) -> None:
+        add_related_task(self.review_dir, "future", text="Future text.", file=None, directory=None)
+        self.assertTrue((self.review_dir / "related-tasks" / "future.md").exists())
+
+        source_dir = self.root / "future"
+        source_dir.mkdir()
+        (source_dir / "README.md").write_text("Directory future task.", encoding="utf-8")
+        add_related_task(self.review_dir, "future", text=None, file=None, directory=source_dir)
+
+        self.assertFalse((self.review_dir / "related-tasks" / "future.md").exists())
+        self.assertTrue((self.review_dir / "related-tasks" / "future" / "README.md").exists())
+        task_text = (self.review_dir / "task.md").read_text(encoding="utf-8")
+        self.assertNotIn("[future](related-tasks/future.md)", task_text)
+        self.assertIn("[future](related-tasks/future/)", task_text)
+
+    def test_related_task_failed_replace_preserves_existing_context(self) -> None:
+        add_related_task(self.review_dir, "future", text="Existing future task.", file=None, directory=None)
+
+        with self.assertRaises(ReviewStateError):
+            add_related_task(self.review_dir, "future", text="  ", file=None, directory=None)
+
+        self.assertEqual(
+            (self.review_dir / "related-tasks" / "future.md").read_text(encoding="utf-8"),
+            "Existing future task.",
+        )
+        self.assertIn("[future](related-tasks/future.md)", (self.review_dir / "task.md").read_text(encoding="utf-8"))
+
+    def test_related_task_file_replace_failure_preserves_existing_file(self) -> None:
+        add_related_task(self.review_dir, "future", text="Existing future task.", file=None, directory=None)
+        real_replace = os.replace
+
+        def fail_future_replace(src: Path, dst: Path) -> None:
+            if Path(dst).name == "future.md" and Path(src).name.endswith(".tmp.md"):
+                raise OSError("replace failed")
+            real_replace(src, dst)
+
+        with mock.patch.object(review_state_module.os, "replace", fail_future_replace):
+            with self.assertRaises(OSError):
+                add_related_task(self.review_dir, "future", text="Replacement task.", file=None, directory=None)
+
+        self.assertEqual(
+            (self.review_dir / "related-tasks" / "future.md").read_text(encoding="utf-8"),
+            "Existing future task.",
+        )
+
+    def test_related_task_type_switch_replace_failure_restores_existing_file(self) -> None:
+        add_related_task(self.review_dir, "future", text="Existing future task.", file=None, directory=None)
+        source_dir = self.root / "future-source"
+        source_dir.mkdir()
+        (source_dir / "README.md").write_text("Replacement directory task.", encoding="utf-8")
+        real_replace = os.replace
+
+        def fail_final_dir_replace(src: Path, dst: Path) -> None:
+            if Path(dst).name == "future":
+                raise OSError("replace failed")
+            real_replace(src, dst)
+
+        with mock.patch.object(review_state_module.os, "replace", fail_final_dir_replace):
+            with self.assertRaises(OSError):
+                add_related_task(self.review_dir, "future", text=None, file=None, directory=source_dir)
+
+        self.assertEqual(
+            (self.review_dir / "related-tasks" / "future.md").read_text(encoding="utf-8"),
+            "Existing future task.",
+        )
+        self.assertFalse((self.review_dir / "related-tasks" / "future").exists())
+
+    def test_related_task_refresh_failure_restores_existing_file(self) -> None:
+        add_related_task(self.review_dir, "future", text="Existing future task.", file=None, directory=None)
+        real_replace = os.replace
+
+        def fail_task_entrypoint_replace(src: Path, dst: Path) -> None:
+            if Path(dst).name == "task.md":
+                raise OSError("task refresh failed")
+            real_replace(src, dst)
+
+        with mock.patch.object(review_state_module.os, "replace", fail_task_entrypoint_replace):
+            with self.assertRaises(OSError):
+                add_related_task(self.review_dir, "future", text="Replacement task.", file=None, directory=None)
+
+        self.assertEqual(
+            (self.review_dir / "related-tasks" / "future.md").read_text(encoding="utf-8"),
+            "Existing future task.",
+        )
+
+    def test_related_task_refresh_preserves_user_request_with_generated_heading_text(self) -> None:
+        review_dir = init_review_state(
+            self.root,
+            "Implement the change.\n\n## Related/Future Tasks\n\nThis heading is part of the user request.",
+        )
+
+        add_related_task(review_dir, "later", text="Address this later.", file=None, directory=None)
+
+        task_text = (review_dir / "task.md").read_text(encoding="utf-8")
+        self.assertIn("This heading is part of the user request.", task_text)
+        self.assertIn("[later](related-tasks/later.md)", task_text)
+
+    def test_related_task_refresh_preserves_user_request_with_sentinel_text(self) -> None:
+        request = (
+            "Document the generated marker text.\n"
+            "<!-- multi-shot-review:original-request:end -->\n"
+            "This line is still part of the original request."
+        )
+        review_dir = init_review_state(self.root, request)
+
+        add_related_task(review_dir, "later", text="Address this later.", file=None, directory=None)
+
+        task_text = (review_dir / "task.md").read_text(encoding="utf-8")
+        self.assertIn("This line is still part of the original request.", task_text)
+        self.assertIn("[later](related-tasks/later.md)", task_text)
+
+    def test_related_task_directory_cannot_contain_review_directory(self) -> None:
+        with self.assertRaises(ReviewStateError):
+            add_related_task(self.review_dir, "repo-root", text=None, file=None, directory=self.root)
+
+        self.assertFalse((self.review_dir / "related-tasks" / "repo-root").exists())
 
     def test_locked_add_slice_and_reload(self) -> None:
         with ReviewState.locked(self.review_dir) as state:
@@ -262,7 +426,7 @@ class RunnerTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "repo"
         self.root.mkdir()
-        self.review_dir = init_review_state(self.root)
+        self.review_dir = init_review_state(self.root, "Review the current uncommitted changes.")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -749,7 +913,8 @@ class RunnerTests(unittest.TestCase):
 
         def runner(cmd, cwd, input_text, output_file, slice_data):
             self.assertEqual(cwd, self.root)
-            self.assertIsNone(input_text)
+            self.assertIsNotNone(input_text)
+            self.assertIn(str(self.review_dir / "task.md"), input_text)
             self.assertEqual(output_file.parent, self.review_dir)
             self.assertRegex(output_file.name, TIMESTAMPED_REVIEW_FILE_RE)
             self.assertTrue(output_file.name.endswith("-1-api.md"))
@@ -760,14 +925,24 @@ class RunnerTests(unittest.TestCase):
             self.assertIn('-c', cmd)
             self.assertEqual(cmd[cmd.index("-c") + 1], 'model_reasoning_effort="high"')
             self.assertIn("--uncommitted", cmd)
-            self.assertEqual(cmd[-2:], ["-o", str(output_file)])
+            self.assertEqual(cmd[-3:], ["-o", str(output_file), "-"])
             output_file.write_text("No findings.", encoding="utf-8")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         run_reviews(self.review_dir, command_runner=runner, stdout=io.StringIO())
 
+    def test_missing_task_entrypoint_fails_before_reserving_runs(self) -> None:
+        self.add_slice("api")
+        (self.review_dir / "task.md").unlink()
+
+        with self.assertRaises(ReviewStateError):
+            run_reviews(self.review_dir, command_runner=_should_not_run, stdout=io.StringIO())
+
+        state = ReviewState.load(self.review_dir)
+        self.assertEqual(state.data["slices"]["api"]["runs"], [])
+
     def test_build_review_command_uses_base_and_commit_targets(self) -> None:
-        base_cmd, _base_input = build_review_command(
+        base_cmd, base_input = build_review_command(
             {
                 "name": "base",
                 "mode": "native",
@@ -777,7 +952,7 @@ class RunnerTests(unittest.TestCase):
             },
             self.review_dir / "1-base.md",
         )
-        commit_cmd, _commit_input = build_review_command(
+        commit_cmd, commit_input = build_review_command(
             {
                 "name": "commit",
                 "mode": "native",
@@ -791,9 +966,13 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--base", base_cmd)
         self.assertEqual(base_cmd[base_cmd.index("--base") + 1], "main")
         self.assertNotIn("--uncommitted", base_cmd)
+        self.assertEqual(base_cmd[-3:], ["-o", str(self.review_dir / "1-base.md"), "-"])
+        self.assertIn(str(self.review_dir / "task.md"), base_input)
         self.assertIn("--commit", commit_cmd)
         self.assertEqual(commit_cmd[commit_cmd.index("--commit") + 1], "abc123")
         self.assertNotIn("--uncommitted", commit_cmd)
+        self.assertEqual(commit_cmd[-3:], ["-o", str(self.review_dir / "1-commit.md"), "-"])
+        self.assertIn(str(self.review_dir / "task.md"), commit_input)
 
     def test_build_review_command_uses_prompt_stdin_and_output(self) -> None:
         cmd, input_text = build_review_command(
@@ -807,7 +986,8 @@ class RunnerTests(unittest.TestCase):
             self.review_dir / "1-api.md",
         )
 
-        self.assertEqual(input_text, "Review only API code.")
+        self.assertIn(str(self.review_dir / "task.md"), input_text)
+        self.assertIn("Slice instructions:\nReview only API code.", input_text)
         self.assertIn("-m", cmd)
         self.assertEqual(cmd[cmd.index("-m") + 1], "gpt-5.5")
         self.assertIn("-c", cmd)
@@ -836,13 +1016,26 @@ class CliTests(unittest.TestCase):
         )
 
     def test_help_outputs(self) -> None:
-        for script in ("init_state.py", "add_slice.py", "run_reviews.py", "report_ignored_findings.py"):
+        for script in (
+            "init_state.py",
+            "add_slice.py",
+            "add_related_task.py",
+            "run_reviews.py",
+            "report_ignored_findings.py",
+        ):
             proc = self.run_cli(str(SCRIPTS / script), "--help")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("usage:", proc.stdout)
 
     def test_cli_paths_with_spaces_and_outside_skill_dir(self) -> None:
-        init = self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root), cwd=Path(self.tmp.name))
+        init = self.run_cli(
+            str(SCRIPTS / "init_state.py"),
+            "--root",
+            str(self.root),
+            "--task",
+            "Review paths with spaces.",
+            cwd=Path(self.tmp.name),
+        )
         self.assertEqual(init.returncode, 0, init.stderr)
         review_dir = Path(init.stdout.strip())
         add = self.run_cli(
@@ -860,9 +1053,103 @@ class CliTests(unittest.TestCase):
         self.assertEqual(Path(state.data["slices"]["api"]["cwd"]), self.root.resolve())
 
     def test_compatibility_wrapper_creates_state(self) -> None:
-        proc = self.run_cli(str(SCRIPTS / "new_review_dir.py"), "--root", str(self.root))
+        proc = self.run_cli(
+            str(SCRIPTS / "new_review_dir.py"),
+            "--root",
+            str(self.root),
+            "--task",
+            "Review compatibility wrapper behavior.",
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue((Path(proc.stdout.strip()) / "_state.json").exists())
+        self.assertTrue((Path(proc.stdout.strip()) / "task.md").exists())
+
+    def test_init_cli_requires_task_and_accepts_stdin_task_file(self) -> None:
+        missing = self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root))
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("choose exactly one task source", missing.stderr)
+
+        init = self.run_cli(
+            str(SCRIPTS / "init_state.py"),
+            "--root",
+            str(self.root),
+            "--task-file",
+            "-",
+            input_text="Review task from stdin.",
+        )
+        self.assertEqual(init.returncode, 0, init.stderr)
+        task_text = (Path(init.stdout.strip()) / "task.md").read_text(encoding="utf-8")
+        self.assertIn("Review task from stdin.", task_text)
+
+        both = self.run_cli(
+            str(SCRIPTS / "init_state.py"),
+            "--root",
+            str(self.root),
+            "--task",
+            "Inline task.",
+            "--task-file",
+            "-",
+            input_text="Stdin task.",
+        )
+        self.assertEqual(both.returncode, 2)
+        self.assertIn("choose exactly one task source", both.stderr)
+
+        empty_inline_with_file = self.run_cli(
+            str(SCRIPTS / "init_state.py"),
+            "--root",
+            str(self.root),
+            "--task",
+            "",
+            "--task-file",
+            "-",
+            input_text="Stdin task.",
+        )
+        self.assertEqual(empty_inline_with_file.returncode, 2)
+        self.assertIn("choose exactly one task source", empty_inline_with_file.stderr)
+
+    def test_add_related_task_cli_updates_task_entrypoint(self) -> None:
+        review_dir = Path(
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review related task CLI.",
+            ).stdout.strip()
+        )
+
+        text = self.run_cli(
+            str(SCRIPTS / "add_related_task.py"),
+            "--review-dir",
+            str(review_dir),
+            "--name",
+            "next-step",
+            "--text",
+            "Implement the next workflow stage later.",
+        )
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertEqual(
+            (review_dir / "related-tasks" / "next-step.md").read_text(encoding="utf-8"),
+            "Implement the next workflow stage later.",
+        )
+        self.assertIn(
+            "[next-step](related-tasks/next-step.md)",
+            (review_dir / "task.md").read_text(encoding="utf-8"),
+        )
+
+        invalid = self.run_cli(
+            str(SCRIPTS / "add_related_task.py"),
+            "--review-dir",
+            str(review_dir),
+            "--name",
+            "next-step",
+            "--text",
+            "Inline.",
+            "--file",
+            str(review_dir / "related-tasks" / "next-step.md"),
+        )
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("choose exactly one", invalid.stderr)
 
     def test_cli_clear_errors_for_missing_state_and_invalid_args(self) -> None:
         missing = self.run_cli(
@@ -877,7 +1164,13 @@ class CliTests(unittest.TestCase):
         self.assertIn("missing review state", missing.stderr)
 
         review_dir = Path(
-            self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root)).stdout.strip()
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review invalid add-slice arguments.",
+            ).stdout.strip()
         )
         invalid = self.run_cli(
             str(SCRIPTS / "add_slice.py"),
@@ -910,14 +1203,27 @@ class CliTests(unittest.TestCase):
         root_file.write_text("", encoding="utf-8")
 
         for script in ("init_state.py", "new_review_dir.py"):
-            proc = self.run_cli(str(SCRIPTS / script), "--root", str(root_file), cwd=Path(self.tmp.name))
+            proc = self.run_cli(
+                str(SCRIPTS / script),
+                "--root",
+                str(root_file),
+                "--task",
+                "Review invalid root handling.",
+                cwd=Path(self.tmp.name),
+            )
             self.assertEqual(proc.returncode, 2)
             self.assertIn("error:", proc.stderr)
             self.assertNotIn("Traceback", proc.stderr)
 
     def test_report_ignored_findings_cli_completes_slice(self) -> None:
         review_dir = Path(
-            self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root)).stdout.strip()
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review ignored finding reporting.",
+            ).stdout.strip()
         )
         with ReviewState.locked(review_dir) as state:
             state.add_slice(
@@ -953,7 +1259,13 @@ class CliTests(unittest.TestCase):
 
     def test_concurrent_add_slice_cli_has_no_lost_updates(self) -> None:
         review_dir = Path(
-            self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root)).stdout.strip()
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review concurrent add-slice behavior.",
+            ).stdout.strip()
         )
         commands = [
             [
@@ -983,7 +1295,13 @@ class CliTests(unittest.TestCase):
 
     def test_concurrent_run_reviews_cli_with_fake_codex_has_no_duplicate_reservations(self) -> None:
         review_dir = Path(
-            self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root)).stdout.strip()
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review concurrent run behavior.",
+            ).stdout.strip()
         )
         add = self.run_cli(
             str(SCRIPTS / "add_slice.py"),
@@ -1002,6 +1320,9 @@ class CliTests(unittest.TestCase):
         fake_codex.write_text(
             "#!/usr/bin/env python3\n"
             "import os, sys, time\n"
+            "data = sys.stdin.read()\n"
+            "assert 'task.md' in data\n"
+            "assert sys.argv[-1] == '-'\n"
             "time.sleep(0.2)\n"
             "with open(os.environ['CODEX_INVOCATION_LOG'], 'a', encoding='utf-8') as log:\n"
             "    log.write('called\\n')\n"
@@ -1038,7 +1359,13 @@ class CliTests(unittest.TestCase):
 
     def test_prompt_file_stdin_cli_passes_prompt_to_fake_codex(self) -> None:
         review_dir = Path(
-            self.run_cli(str(SCRIPTS / "init_state.py"), "--root", str(self.root)).stdout.strip()
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review prompted slices.",
+            ).stdout.strip()
         )
         prompt = "Review the current uncommitted changes.\nSlice: API only.\n"
         add = self.run_cli(
@@ -1084,7 +1411,9 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(captured_prompt.read_text(encoding="utf-8"), prompt)
+        captured = captured_prompt.read_text(encoding="utf-8")
+        self.assertIn(str(review_dir / "task.md"), captured)
+        self.assertIn("Slice instructions:\n" + prompt, captured)
         state = ReviewState.load(review_dir)
         self.assertEqual(state.data["slices"]["api-prompt"]["mode"], "prompt")
         self.assertTrue(state.data["slices"]["api-prompt"]["complete"])
