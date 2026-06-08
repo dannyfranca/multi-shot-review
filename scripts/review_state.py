@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,10 @@ from typing import Any, Callable, Iterable
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_REASONING = "high"
+TASK_ENTRYPOINT = "task.md"
+RELATED_TASKS_DIR = "related-tasks"
+ORIGINAL_REQUEST_START = "<!-- multi-shot-review:original-request:start -->"
+ORIGINAL_REQUEST_END = "<!-- multi-shot-review:original-request:end -->"
 SLICE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 PRIORITY_RE = re.compile(r"\[(?:P[0-3])\]", re.IGNORECASE)
 REVIEW_COMMENT_RE = re.compile(r"Review comment:", re.IGNORECASE)
@@ -98,11 +103,222 @@ def create_review_dir(root: Path) -> Path:
     raise ReviewStateError("could not create a unique review directory after 10 attempts")
 
 
-def init_review_state(root: Path) -> Path:
+def init_review_state(root: Path, task: str) -> Path:
+    task = _require_non_empty_text(task, "task")
     review_dir = create_review_dir(root)
+    write_task_entrypoint(review_dir, task)
     state = ReviewState.new(review_dir=review_dir, root=root.resolve())
     state.save()
     return review_dir
+
+
+def task_entrypoint(review_dir: Path) -> Path:
+    return review_dir.resolve() / TASK_ENTRYPOINT
+
+
+def related_tasks_dir(review_dir: Path) -> Path:
+    return review_dir.resolve() / RELATED_TASKS_DIR
+
+
+def write_task_entrypoint(review_dir: Path, original_request: str) -> None:
+    original_request = _require_non_empty_text(original_request, "task")
+    review_dir = review_dir.resolve()
+    related_tasks_dir(review_dir).mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(task_entrypoint(review_dir), _render_task_entrypoint(review_dir, original_request))
+
+
+def add_related_task(review_dir: Path, name: str, *, text: str | None, file: Path | None, directory: Path | None) -> None:
+    ReviewState._validate_slice_name(name)
+    input_count = sum(value is not None for value in (text, file, directory))
+    if input_count != 1:
+        raise ReviewStateError("choose exactly one related task input: --text, --file, or --dir")
+
+    review_dir = review_dir.resolve()
+    with ReviewState.locked(review_dir):
+        entrypoint = task_entrypoint(review_dir)
+        if not entrypoint.exists():
+            raise ReviewStateError(f"missing task entrypoint: {entrypoint}")
+
+        related_dir = related_tasks_dir(review_dir)
+        related_dir.mkdir(parents=True, exist_ok=True)
+        file_target = related_dir / f"{name}.md"
+        dir_target = related_dir / name
+        tmp_target: Path | None = None
+
+        try:
+            if text is not None:
+                tmp_target = related_dir / f".{name}.{uuid.uuid4().hex}.tmp.md"
+                tmp_target.write_text(_require_non_empty_text(text, "related task text"), encoding="utf-8")
+                final_target = file_target
+            elif file is not None:
+                if not file.is_file():
+                    raise ReviewStateError(f"related task file is not a file: {file}")
+                source_text = _require_non_empty_text(file.read_text(encoding="utf-8"), "related task file")
+                tmp_target = related_dir / f".{name}.{uuid.uuid4().hex}.tmp.md"
+                tmp_target.write_text(source_text, encoding="utf-8")
+                final_target = file_target
+            elif directory is not None:
+                if not directory.is_dir():
+                    raise ReviewStateError(f"related task directory is not a directory: {directory}")
+                if _path_is_relative_to(related_dir.resolve(), directory.resolve()):
+                    raise ReviewStateError("related task directory cannot contain the review directory")
+                tmp_target = related_dir / f".{name}.{uuid.uuid4().hex}.tmp"
+                shutil.copytree(directory, tmp_target)
+                final_target = dir_target
+
+            backups = _backup_related_task_targets(
+                file_target=file_target,
+                dir_target=dir_target,
+            )
+            replaced = False
+            try:
+                os.replace(tmp_target, final_target)
+                replaced = True
+                tmp_target = None
+                refresh_task_entrypoint(review_dir)
+            except Exception:
+                if replaced:
+                    _remove_related_task_target(final_target)
+                _restore_related_task_backups(backups)
+                raise
+            _remove_related_task_backups(backups)
+            tmp_target = None
+        finally:
+            if tmp_target is not None and tmp_target.exists():
+                _remove_related_task_target(tmp_target)
+
+
+def refresh_task_entrypoint(review_dir: Path) -> None:
+    review_dir = review_dir.resolve()
+    entrypoint = task_entrypoint(review_dir)
+    if not entrypoint.exists():
+        raise ReviewStateError(f"missing task entrypoint: {entrypoint}")
+    original_request = _extract_original_request(entrypoint.read_text(encoding="utf-8"))
+    _atomic_write_text(entrypoint, _render_task_entrypoint(review_dir, original_request))
+
+
+def build_task_context_prompt(review_dir: Path) -> str:
+    entrypoint = task_entrypoint(review_dir)
+    if not entrypoint.exists():
+        raise ReviewStateError(f"missing task entrypoint: {entrypoint}")
+    return (
+        "Review task context:\n"
+        f"- Read {entrypoint} before reviewing.\n"
+        "- It contains the original user request and any related/future tasks.\n"
+        "- Treat related/future tasks as deferred-work context, not as part of the current review scope.\n"
+        "- Avoid flagging missing follow-up work when it is clearly covered by related/future tasks.\n"
+    )
+
+
+def _require_non_empty_text(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ReviewStateError(f"{label} must be non-empty")
+    return value.strip()
+
+
+def _render_task_entrypoint(review_dir: Path, original_request: str) -> str:
+    original_request = _require_non_empty_text(original_request, "task")
+    related_items = _related_task_index_items(review_dir)
+    related_section = "\n".join(related_items) if related_items else "No related/future tasks registered."
+    return (
+        "# Review Task\n\n"
+        "## Original User Request\n\n"
+        f"{ORIGINAL_REQUEST_START}\n"
+        f"{original_request}\n\n"
+        f"{ORIGINAL_REQUEST_END}\n\n"
+        "## Related/Future Tasks\n\n"
+        f"{related_section}\n\n"
+        "## Reviewer Guidance\n\n"
+        "- Review the current slice against the original user request.\n"
+        "- Treat related/future tasks as deferred-work context, not as current review scope.\n"
+        "- Do not flag missing follow-up work when it is clearly covered by a related/future task.\n"
+    )
+
+
+def _related_task_index_items(review_dir: Path) -> list[str]:
+    related_dir = related_tasks_dir(review_dir)
+    if not related_dir.exists():
+        return []
+    items: list[str] = []
+    for path in sorted(related_dir.iterdir(), key=lambda item: item.name):
+        if path.name.startswith("."):
+            continue
+        if path.is_file() and path.suffix == ".md":
+            items.append(f"- [{path.stem}]({RELATED_TASKS_DIR}/{path.name})")
+        elif path.is_dir():
+            items.append(f"- [{path.name}]({RELATED_TASKS_DIR}/{path.name}/)")
+    return items
+
+
+def _extract_original_request(task_text: str) -> str:
+    if ORIGINAL_REQUEST_START in task_text and ORIGINAL_REQUEST_END in task_text:
+        original_request = task_text.split(ORIGINAL_REQUEST_START, 1)[1].rsplit(ORIGINAL_REQUEST_END, 1)[0]
+        return _require_non_empty_text(original_request, "task")
+
+    start_marker = "## Original User Request\n\n"
+    end_marker = "\n\n## Related/Future Tasks\n\n"
+    if start_marker not in task_text or end_marker not in task_text:
+        raise ReviewStateError("task entrypoint has an unsupported format")
+    original_request = task_text.split(start_marker, 1)[1].split(end_marker, 1)[0]
+    return _require_non_empty_text(original_request, "task")
+
+
+def _remove_related_task_target(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def _backup_related_task_targets(
+    *,
+    file_target: Path,
+    dir_target: Path,
+) -> list[tuple[Path, Path]]:
+    targets = [file_target, dir_target]
+    backups: list[tuple[Path, Path]] = []
+    for target in targets:
+        if not target.exists():
+            continue
+        backup = target.parent / f".{target.name}.{uuid.uuid4().hex}.bak"
+        os.replace(target, backup)
+        backups.append((target, backup))
+    return backups
+
+
+def _restore_related_task_backups(backups: list[tuple[Path, Path]]) -> None:
+    for target, backup in reversed(backups):
+        if backup.exists():
+            _remove_related_task_target(target)
+            os.replace(backup, target)
+
+
+def _remove_related_task_backups(backups: list[tuple[Path, Path]]) -> None:
+    for _target, backup in backups:
+        if backup.exists():
+            _remove_related_task_target(backup)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def classify_output(text: str) -> str:
@@ -718,6 +934,7 @@ class ReviewState:
 
 
 def build_review_command(slice_data: dict[str, Any], output_file: Path) -> tuple[list[str], str | None]:
+    task_prompt = build_task_context_prompt(output_file.parent)
     cmd = [
         "codex",
         "exec",
@@ -738,11 +955,11 @@ def build_review_command(slice_data: dict[str, Any], output_file: Path) -> tuple
             cmd.extend(["--commit", target["commit"]])
         else:
             raise ReviewStateError("native slice target is invalid")
-        cmd.extend(["-o", str(output_file)])
-        return cmd, None
+        cmd.extend(["-o", str(output_file), "-"])
+        return cmd, task_prompt
 
     cmd.extend(["-o", str(output_file), "-"])
-    return cmd, slice_data["prompt"]
+    return cmd, f"{task_prompt}\nSlice instructions:\n{slice_data['prompt']}"
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -886,6 +1103,7 @@ def run_reviews(
     stdout: Any = sys.stdout,
 ) -> int:
     review_dir = review_dir.resolve()
+    build_task_context_prompt(review_dir)
     with ReviewState.locked(review_dir) as state:
         reservations = state.reserve_eligible()
         state.save()
