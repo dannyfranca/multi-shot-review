@@ -68,7 +68,7 @@ SKILL_DIR=/path/to/this-skill
 python3 "$SKILL_DIR/scripts/run_reviews.py" --review-dir "$REVIEW_DIR"
 ```
 
-6. After the command exits, use the single JSON object it printed. Then read only the review files listed in JSON `out`. If JSON `err` is non-null, inspect only the listed error logs needed to diagnose the failure. A copy of the last summary is also written to `$REVIEW_DIR/_last-run.json` for recovery if terminal output is lost.
+6. After the command exits, use the single JSON object it printed. Then read only the review files listed in JSON `out`. If JSON `err` is non-null, inspect only the listed error logs needed to diagnose the failure.
 7. Validate every finding against the actual code and task intent.
 8. Fix only real, relevant findings. Add focused regression tests when they materially reduce risk.
 9. If a slice's latest run has findings and you ignore one or more findings from that run, report the ignored count. The script decides whether that count completes the slice or leaves a follow-up run required:
@@ -107,10 +107,6 @@ After the command exits, read only:
 1. The single JSON object printed by the command
 2. Review files listed in the JSON `out` array
 3. Error logs listed in the JSON `err` array, only when needed
-
-The runner also writes the same final summary to `$REVIEW_DIR/_last-run.json` as the standard last-run record, but the normal agent workflow should use the single stdout JSON object and avoid extra pre-review file-reading steps.
-
-For local human debugging only, `--stream-progress` can be used to emit per-slice progress to stderr. Do not use `--stream-progress` in agent workflows or in this skill's recommended command.
 
 ## Slice Selection
 

@@ -1862,9 +1862,18 @@ class CliTests(unittest.TestCase):
         self.assertIn('python3 "$SKILL_DIR/scripts/run_reviews.py" --review-dir "$REVIEW_DIR"', text)
         self.assertNotIn("--summary-json", text)
         self.assertNotIn("--no-stdout", text)
+        self.assertNotIn("--stream-progress", text)
+        self.assertNotIn("_last-run.json", text)
         self.assertIn("Do not run it with `&`, `nohup`, `disown`, `tmux`, `screen`", text)
         self.assertIn("2 hours / 7,200,000 ms", text)
         self.assertNotIn("Keep calling it until it prints `done`", text)
+
+    def test_readme_documents_human_recovery_and_debug_options(self) -> None:
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("_last-run.json", text)
+        self.assertIn("recovery path", text)
+        self.assertIn("--stream-progress", text)
+        self.assertIn("local human debugging", text)
 
 
 def _writes(text: str):
