@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import AbstractContextManager
@@ -428,7 +429,10 @@ class Reservation:
 class ReviewExecution:
     reservation: Reservation
     proc: subprocess.CompletedProcess[str]
+    stdout_log: Path
+    stderr_log: Path
     launch_error: OSError | None = None
+    timed_out: bool = False
 
 
 class LockedReviewState(AbstractContextManager["ReviewState"]):
@@ -586,7 +590,7 @@ class ReviewState:
             raise ReviewStateError(f"slice {slice_name!r} has run with invalid pass")
         if not isinstance(run.get("output_file"), str) or not run["output_file"]:
             raise ReviewStateError(f"slice {slice_name!r} has run with invalid output_file")
-        if run.get("status") not in {"running", "findings", "quiet", "uncertain", "failed", "ignored"}:
+        if run.get("status") not in {"running", "findings", "quiet", "uncertain", "failed", "timeout", "ignored"}:
             raise ReviewStateError(f"slice {slice_name!r} has run with invalid status")
         if not isinstance(run.get("started_at"), str) or not run["started_at"]:
             raise ReviewStateError(f"slice {slice_name!r} has run with invalid started_at")
@@ -773,9 +777,9 @@ class ReviewState:
         elif status in {"quiet", "uncertain"}:
             item["complete"] = True
             item["last_error"] = None
-        elif status == "failed":
+        elif status in {"failed", "timeout"}:
             item["complete"] = False
-            item["last_error"] = error or "review process failed"
+            item["last_error"] = error or ("review process timed out" if status == "timeout" else "review process failed")
             self.data["last_error"] = {"slice": slice_name, "run_id": run_id, "error": item["last_error"], "at": now_iso()}
         else:
             raise ReviewStateError(f"invalid run status: {status}")
@@ -1025,50 +1029,115 @@ def default_runner(
     output_file: Path,
     slice_data: dict[str, Any],
 ) -> subprocess.CompletedProcess[str]:
-    del output_file, slice_data
-    return subprocess.run(
-        cmd,
-        cwd=cwd,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    del output_file
+    timeout = slice_data.get("_child_timeout_seconds") or None
+    stdout_log = Path(slice_data["_stdout_log"])
+    stderr_log = Path(slice_data["_stderr_log"])
+    stdout_log.parent.mkdir(parents=True, exist_ok=True)
+    stderr_log.parent.mkdir(parents=True, exist_ok=True)
+    with stdout_log.open("w", encoding="utf-8") as out_fh, stderr_log.open("w", encoding="utf-8") as err_fh:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            input=input_text,
+            text=True,
+            stdout=out_fh,
+            stderr=err_fh,
+            timeout=timeout,
+            check=False,
+        )
+
+
+def _log_paths(review_dir: Path, reservation: Reservation) -> tuple[Path, Path]:
+    log_dir = review_dir / "_logs"
+    safe_slice = re.sub(r"[^a-zA-Z0-9._-]+", "-", reservation.slice_name)
+    prefix = f"{reservation.run_id}-{reservation.pass_number}-{safe_slice}"
+    return log_dir / f"{prefix}.stdout.log", log_dir / f"{prefix}.stderr.log"
+
+
+def _write_completed_process_logs(proc: subprocess.CompletedProcess[str], stdout_log: Path, stderr_log: Path) -> None:
+    stdout_log.parent.mkdir(parents=True, exist_ok=True)
+    if proc.stdout:
+        stdout_log.write_text(str(proc.stdout), encoding="utf-8")
+    else:
+        stdout_log.touch(exist_ok=True)
+    if proc.stderr:
+        stderr_log.write_text(str(proc.stderr), encoding="utf-8")
+    else:
+        stderr_log.touch(exist_ok=True)
 
 
 def run_reserved_review(
     reservation: Reservation,
     command_runner: Runner,
+    child_timeout_seconds: float | None = None,
 ) -> ReviewExecution:
-    cmd, input_text = build_review_command(reservation.slice_data, reservation.output_file)
+    stdout_log, stderr_log = _log_paths(reservation.output_file.parent, reservation)
+    slice_data = json.loads(json.dumps(reservation.slice_data))
+    slice_data["_stdout_log"] = str(stdout_log)
+    slice_data["_stderr_log"] = str(stderr_log)
+    slice_data["_child_timeout_seconds"] = child_timeout_seconds
+    enriched = Reservation(
+        run_id=reservation.run_id,
+        slice_name=reservation.slice_name,
+        pass_number=reservation.pass_number,
+        output_file=reservation.output_file,
+        slice_data=slice_data,
+    )
+    cmd, input_text = build_review_command(slice_data, enriched.output_file)
     try:
         proc = command_runner(
             cmd,
-            Path(reservation.slice_data["cwd"]),
+            Path(slice_data["cwd"]),
             input_text,
-            reservation.output_file,
-            reservation.slice_data,
+            enriched.output_file,
+            slice_data,
         )
+        _write_completed_process_logs(proc, stdout_log, stderr_log)
+    except subprocess.TimeoutExpired as exc:
+        timeout_msg = f"review command timed out after {exc.timeout} seconds"
+        proc = subprocess.CompletedProcess(cmd, 124, exc.stdout or "", exc.stderr or "")
+        _write_completed_process_logs(proc, stdout_log, stderr_log)
+        with stderr_log.open("a", encoding="utf-8") as fh:
+            if stderr_log.stat().st_size:
+                fh.write("\n")
+            fh.write(f"[runner] {timeout_msg}\n")
+        return ReviewExecution(reservation=enriched, proc=proc, stdout_log=stdout_log, stderr_log=stderr_log, timed_out=True)
     except OSError as exc:
         proc = subprocess.CompletedProcess(cmd, 1, "", str(exc))
-        return ReviewExecution(reservation=reservation, proc=proc, launch_error=exc)
-    return ReviewExecution(reservation=reservation, proc=proc)
+        _write_completed_process_logs(proc, stdout_log, stderr_log)
+        return ReviewExecution(reservation=enriched, proc=proc, stdout_log=stdout_log, stderr_log=stderr_log, launch_error=exc)
+    return ReviewExecution(reservation=enriched, proc=proc, stdout_log=stdout_log, stderr_log=stderr_log)
 
 
 def evaluate_completed_process(
     review_dir: Path,
     reservation: Reservation,
     proc: subprocess.CompletedProcess[str],
+    *,
+    stdout_log: Path,
+    stderr_log: Path,
+    timed_out: bool = False,
 ) -> tuple[str, str | None, int | None, str | None]:
     output_file = reservation.output_file
+    if timed_out:
+        error = (
+            f"Slice: {reservation.slice_name}\n"
+            f"Output: {output_file}\n"
+            f"Exit code: {proc.returncode}\n"
+            f"stdout log: {stdout_log}\n"
+            f"stderr log: {stderr_log}\n"
+            "Error: review command timed out"
+        )
+        append_error(review_dir, f"timed out review for {reservation.slice_name}", error)
+        return "timeout", None, None, "review command timed out"
     if proc.returncode != 0:
         error = (
             f"Slice: {reservation.slice_name}\n"
             f"Output: {output_file}\n"
-            f"Exit code: {proc.returncode}\n\n"
-            f"stdout:\n{proc.stdout or ''}\n\n"
-            f"stderr:\n{proc.stderr or ''}"
+            f"Exit code: {proc.returncode}\n"
+            f"stdout log: {stdout_log}\n"
+            f"stderr log: {stderr_log}"
         )
         append_error(review_dir, f"failed review for {reservation.slice_name}", error)
         return "failed", None, None, f"review command exited with {proc.returncode}"
@@ -1096,37 +1165,218 @@ def evaluate_completed_process(
     return classification, classification, finding_count, None
 
 
+def _relative_path(path: Path, *, base: Path | None = None) -> str:
+    resolved = path.resolve()
+    base = Path.cwd().resolve() if base is None else base.resolve()
+    try:
+        return resolved.relative_to(base).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
+def _remaining_count(state: ReviewState) -> int:
+    return sum(1 for item in state.data["slices"].values() if not item.get("complete"))
+
+
+def _summary(
+    review_dir: Path,
+    *,
+    status: str,
+    ok: bool,
+    ran: int,
+    remaining: int,
+    out_records: list[dict[str, Any]],
+    err_records: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    ordered_errors = (
+        sorted(err_records, key=lambda rec: (rec.get("p", 0), rec.get("s", ""), rec.get("f", "")))
+        if err_records
+        else None
+    )
+    return {
+        "dir": _relative_path(review_dir),
+        "err": ordered_errors,
+        "ok": ok,
+        "out": sorted(out_records, key=lambda rec: (rec["p"], rec["s"], rec["f"])),
+        "ran": ran,
+        "rem": remaining,
+        "st": status,
+        "state": _relative_path(review_dir / "_state.json"),
+        "v": 1,
+    }
+
+
+def _error_record_for_run(
+    review_dir: Path,
+    *,
+    slice_name: str,
+    pass_number: int,
+    output_file: Path,
+    run_id: str,
+    status: str,
+    code: int | None,
+    msg: str | None,
+) -> dict[str, Any]:
+    reservation = Reservation(
+        run_id=run_id,
+        slice_name=slice_name,
+        pass_number=pass_number,
+        output_file=output_file,
+        slice_data={},
+    )
+    stdout_log, stderr_log = _log_paths(review_dir, reservation)
+    return {
+        "code": code,
+        "f": _relative_path(output_file),
+        "msg": msg or status,
+        "p": pass_number,
+        "s": slice_name,
+        "st": "timeout" if status == "timeout" else "failed",
+        "stderr": _relative_path(stderr_log),
+        "stdout": _relative_path(stdout_log),
+    }
+
+
+def compact_summary_json(summary: dict[str, Any], *, pretty: bool = False) -> str:
+    if pretty:
+        return json.dumps(summary, indent=2, sort_keys=True)
+    return json.dumps(summary, separators=(",", ":"), sort_keys=True)
+
+
+def write_summary_json(path: Path, summary: dict[str, Any], *, pretty: bool = False) -> None:
+    text = compact_summary_json(summary, pretty=pretty) + "\n"
+    _atomic_write_text(path, text)
+
+
+def _emit_summary(
+    summary: dict[str, Any],
+    *,
+    review_dir: Path,
+    summary_json: Path | None,
+    no_stdout: bool,
+    stdout_json: bool,
+    stdout: Any,
+    pretty_json: bool,
+) -> None:
+    default_summary_json = review_dir / "_last-run.json"
+    write_summary_json(default_summary_json, summary, pretty=pretty_json)
+    if summary_json is not None:
+        requested_summary_json = summary_json.resolve()
+        if requested_summary_json != default_summary_json.resolve():
+            write_summary_json(requested_summary_json, summary, pretty=pretty_json)
+    if stdout_json and not no_stdout:
+        stdout.write(compact_summary_json(summary, pretty=pretty_json) + "\n")
+        stdout.flush()
+
+
 def run_reviews(
     review_dir: Path,
     *,
     command_runner: Runner = default_runner,
     stdout: Any = sys.stdout,
-) -> int:
+    stream_progress: bool = False,
+    progress_stream: Any | None = None,
+    summary_json: Path | None = None,
+    no_stdout: bool = False,
+    stdout_json: bool = False,
+    pretty_json: bool = False,
+    child_timeout_seconds: float | None = None,
+) -> tuple[int, dict[str, Any]]:
+    if no_stdout and summary_json is None:
+        raise ReviewStateError("--no-stdout requires --summary-json")
+    if stream_progress and no_stdout:
+        raise ReviewStateError("--stream-progress is incompatible with --no-stdout")
+    if child_timeout_seconds is not None and child_timeout_seconds <= 0:
+        child_timeout_seconds = None
+
     review_dir = review_dir.resolve()
     build_task_context_prompt(review_dir)
+    remaining = 0
+    any_running = False
+    active_run_ids: set[str] = set()
     with ReviewState.locked(review_dir) as state:
         reservations = state.reserve_eligible()
         state.save()
-        completed = state.data["completed"]
-        any_running = any(
-            run.get("status") == "running"
-            for item in state.data["slices"].values()
-            for run in item.get("runs", [])
-            if all(run.get("id") != reservation.run_id for reservation in reservations)
-        )
+        remaining = _remaining_count(state)
+        any_running = state._has_running_runs()
+        if any_running and not reservations:
+            active_run_ids = {
+                str(run["id"])
+                for item in state.data["slices"].values()
+                for run in item.get("runs", [])
+                if run.get("status") == "running"
+            }
 
     if not reservations:
-        if completed:
-            print("done: all review slices are complete; no further review runs are needed.", file=stdout)
-        elif any_running:
-            print("waiting: no eligible slices; review runs are already in progress. call again later.", file=stdout)
-        else:
-            print("waiting: no review slices have been registered. add slices, then call again.", file=stdout)
-        return 0
+        waited_errors: list[dict[str, Any]] = []
+        waited_out: list[dict[str, Any]] = []
+        if any_running:
+            while True:
+                time.sleep(0.25)
+                with ReviewState.locked(review_dir) as state:
+                    state._recover_stale_running_runs()
+                    state._refresh_completed()
+                    state.save()
+                    remaining = _remaining_count(state)
+                    if state._has_running_runs():
+                        continue
+                    for slice_name, item in state.data["slices"].items():
+                        for run in item.get("runs", []):
+                            if run.get("id") not in active_run_ids:
+                                continue
+                            if run.get("status") in {"failed", "timeout"}:
+                                waited_errors.append(
+                                    _error_record_for_run(
+                                        review_dir,
+                                        slice_name=slice_name,
+                                        pass_number=int(run["pass"]),
+                                        output_file=Path(run["output_file"]),
+                                        run_id=str(run["id"]),
+                                        status=str(run["status"]),
+                                        code=run.get("exit_code"),
+                                        msg=run.get("error"),
+                                    )
+                                )
+                            elif run.get("status") in {"quiet", "uncertain", "findings", "ignored"}:
+                                waited_out.append(
+                                    {
+                                        "f": _relative_path(Path(run["output_file"])),
+                                        "p": int(run["pass"]),
+                                        "s": slice_name,
+                                        "st": "done",
+                                    }
+                                )
+                    break
+        ok = not waited_errors
+        status = "failed" if waited_errors else ("partial" if remaining else "no_work")
+        summary = _summary(
+            review_dir,
+            status=status,
+            ok=ok,
+            ran=0,
+            remaining=remaining,
+            out_records=waited_out,
+            err_records=waited_errors,
+        )
+        _emit_summary(
+            summary,
+            review_dir=review_dir,
+            summary_json=summary_json,
+            no_stdout=no_stdout,
+            stdout_json=stdout_json,
+            stdout=stdout,
+            pretty_json=pretty_json,
+        )
+        return (0 if ok else 2), summary
 
-    state_completed = False
+    out_records: list[dict[str, Any]] = []
+    err_records: list[dict[str, Any]] = []
+    progress_stream = sys.stderr if progress_stream is None else progress_stream
     with ThreadPoolExecutor(max_workers=len(reservations)) as executor:
-        futures = [executor.submit(run_reserved_review, reservation, command_runner) for reservation in reservations]
+        futures = [
+            executor.submit(run_reserved_review, reservation, command_runner, child_timeout_seconds)
+            for reservation in reservations
+        ]
         for future in as_completed(futures):
             execution = future.result()
             reservation = execution.reservation
@@ -1145,7 +1395,14 @@ def run_reviews(
                     f"review command failed to launch: {exc}",
                 )
             else:
-                status, classification, finding_count, error = evaluate_completed_process(review_dir, reservation, proc)
+                status, classification, finding_count, error = evaluate_completed_process(
+                    review_dir,
+                    reservation,
+                    proc,
+                    stdout_log=execution.stdout_log,
+                    stderr_log=execution.stderr_log,
+                    timed_out=execution.timed_out,
+                )
             with ReviewState.locked(review_dir) as state:
                 completion_applied = state.complete_run(
                     run_id=reservation.run_id,
@@ -1157,19 +1414,65 @@ def run_reviews(
                     error=error,
                 )
                 state.save()
-                state_completed = state.data["completed"]
+                remaining = _remaining_count(state)
             display_status = status if completion_applied else "skipped-late-completion"
-            print(
-                f"{reservation.slice_name}: pass {reservation.pass_number} {display_status} -> {reservation.output_file}",
-                file=stdout,
-                flush=True,
-            )
+            if stream_progress:
+                print(
+                    f"{reservation.slice_name}: pass {reservation.pass_number} {display_status} -> {reservation.output_file}",
+                    file=progress_stream,
+                    flush=True,
+                )
+            if status in {"failed", "timeout"} or execution.launch_error is not None:
+                err_record: dict[str, Any] = {
+                    "code": proc.returncode,
+                    "f": _relative_path(reservation.output_file),
+                    "msg": error or display_status,
+                    "p": reservation.pass_number,
+                    "s": reservation.slice_name,
+                    "st": "timeout" if status == "timeout" else "failed",
+                    "stderr": _relative_path(execution.stderr_log),
+                    "stdout": _relative_path(execution.stdout_log),
+                }
+                err_records.append(err_record)
+            else:
+                out_records.append(
+                    {
+                        "f": _relative_path(reservation.output_file),
+                        "p": reservation.pass_number,
+                        "s": reservation.slice_name,
+                        "st": "done",
+                    }
+                )
 
-    if state_completed:
-        print("done: all review slices are complete; no further review runs are needed.", file=stdout)
+    ok = not err_records
+    with ReviewState.locked(review_dir) as state:
+        remaining = _remaining_count(state)
+    if err_records:
+        top_status = "partial" if out_records else "failed"
+    elif remaining:
+        top_status = "partial"
     else:
-        print("call again: at least one review slice remains eligible for another pass.", file=stdout)
-    return 0
+        top_status = "done"
+    rc = 0 if ok else 2
+    summary = _summary(
+        review_dir,
+        status=top_status,
+        ok=ok,
+        ran=len(reservations),
+        remaining=remaining,
+        out_records=out_records,
+        err_records=err_records,
+    )
+    _emit_summary(
+        summary,
+        review_dir=review_dir,
+        summary_json=summary_json,
+        no_stdout=no_stdout,
+        stdout_json=stdout_json,
+        stdout=stdout,
+        pretty_json=pretty_json,
+    )
+    return rc, summary
 
 
 def parse_add_slice_args(argv: list[str] | None = None) -> argparse.Namespace:

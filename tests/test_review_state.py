@@ -344,9 +344,10 @@ class ReviewStateTests(unittest.TestCase):
             state.save()
 
         output = io.StringIO()
-        rc = run_reviews(self.review_dir, command_runner=_should_not_run, stdout=output)
+        rc, summary = run_reviews(self.review_dir, command_runner=_should_not_run, stdout=output)
         self.assertEqual(rc, 0)
-        self.assertIn("done:", output.getvalue())
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(summary["st"], "no_work")
 
 
 class ClassifierTests(unittest.TestCase):
@@ -442,18 +443,154 @@ class RunnerTests(unittest.TestCase):
             )
             state.save()
 
+    def run_reviews(self, *args, **kwargs) -> tuple[int, dict]:
+        return run_reviews(self.review_dir, *args, **kwargs)
+
+    def test_default_run_reviews_is_quiet_until_barrier_completes(self) -> None:
+        self.add_slice("fast")
+        self.add_slice("slow")
+
+        fast_done = threading.Event()
+        slow_can_finish = threading.Event()
+        stdout = io.StringIO()
+        results: list[tuple[int, dict]] = []
+        errors: list[BaseException] = []
+
+        def runner(cmd, cwd, input_text, output_file, slice_data):
+            if slice_data["name"] == "fast":
+                output_file.write_text("No findings.", encoding="utf-8")
+                fast_done.set()
+                return subprocess.CompletedProcess(cmd, 0, "fast stdout", "fast stderr")
+            self.assertTrue(fast_done.wait(timeout=2))
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertTrue(slow_can_finish.wait(timeout=2))
+            output_file.write_text("No findings.", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, "slow stdout", "slow stderr")
+
+        def invoke() -> None:
+            try:
+                results.append(self.run_reviews(command_runner=runner, stdout=stdout, stdout_json=True))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=invoke)
+        thread.start()
+        try:
+            self.assertTrue(fast_done.wait(timeout=2))
+            time.sleep(0.05)
+            self.assertEqual(stdout.getvalue(), "")
+            slow_can_finish.set()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            if errors:
+                raise errors[0]
+        finally:
+            slow_can_finish.set()
+            thread.join(timeout=2)
+
+        self.assertEqual(results[0][0], 0)
+        emitted = stdout.getvalue()
+        self.assertEqual(emitted.count("\n"), 1)
+        summary = json.loads(emitted)
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["st"], "done")
+        self.assertEqual(summary["ran"], 2)
+        self.assertEqual(summary["rem"], 0)
+        self.assertEqual(results[0][1], summary)
+        self.assertEqual(json.loads((self.review_dir / "_last-run.json").read_text(encoding="utf-8")), summary)
+        self.assertFalse(any(path.name.startswith("._last-run.json") for path in self.review_dir.iterdir()))
+
+    def test_summary_json_no_stdout_writes_atomic_summary(self) -> None:
+        self.add_slice("api")
+        summary_path = self.review_dir / "_last-run.json"
+        stdout = io.StringIO()
+
+        rc, summary = self.run_reviews(
+            command_runner=_writes("No findings."),
+            summary_json=summary_path,
+            no_stdout=True,
+            stdout=stdout,
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(json.loads(summary_path.read_text(encoding="utf-8")), summary)
+        self.assertFalse(any(path.name.startswith("._last-run.json") for path in self.review_dir.iterdir()))
+
+    def test_child_output_is_logged_not_streamed_and_failure_summary_has_log_paths(self) -> None:
+        self.add_slice("api")
+        stdout = io.StringIO()
+
+        def runner(cmd, cwd, input_text, output_file, slice_data):
+            return subprocess.CompletedProcess(cmd, 1, "CHILD STDOUT BODY", "CHILD STDERR BODY")
+
+        rc, summary = self.run_reviews(command_runner=runner, stdout=stdout, stdout_json=True)
+
+        self.assertEqual(rc, 2)
+        self.assertNotIn("CHILD STDOUT BODY", stdout.getvalue())
+        self.assertNotIn("CHILD STDERR BODY", stdout.getvalue())
+        self.assertFalse(summary["ok"])
+        self.assertIn(summary["st"], {"partial", "failed"})
+        self.assertIsInstance(summary["err"], list)
+        err = summary["err"][0]
+        self.assertIn("stdout", err)
+        self.assertIn("stderr", err)
+        self.assertNotIn("CHILD STDOUT BODY", json.dumps(summary))
+        self.assertNotIn("CHILD STDERR BODY", json.dumps(summary))
+        stdout_log = self.root / err["stdout"]
+        if not stdout_log.exists():
+            stdout_log = self.review_dir / err["stdout"]
+        stderr_log = self.root / err["stderr"]
+        if not stderr_log.exists():
+            stderr_log = self.review_dir / err["stderr"]
+        self.assertTrue(stdout_log.exists())
+        self.assertTrue(stderr_log.exists())
+        self.assertEqual(stdout_log.read_text(encoding="utf-8"), "CHILD STDOUT BODY")
+        self.assertEqual(stderr_log.read_text(encoding="utf-8"), "CHILD STDERR BODY")
+
+    def test_no_work_summary_is_compact_success(self) -> None:
+        rc, summary = self.run_reviews(command_runner=_should_not_run)
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["st"], "no_work")
+        self.assertEqual(summary["ran"], 0)
+        self.assertEqual(summary["out"], [])
+        self.assertIsNone(summary["err"])
+        self.assertEqual(json.loads((self.review_dir / "_last-run.json").read_text(encoding="utf-8")), summary)
+
+    def test_child_timeout_marks_attempt_failed_with_log_paths(self) -> None:
+        self.add_slice("api")
+
+        def runner(cmd, cwd, input_text, output_file, slice_data):
+            raise subprocess.TimeoutExpired(cmd, timeout=1, output="partial stdout", stderr="partial stderr")
+
+        rc, summary = self.run_reviews(command_runner=runner, child_timeout_seconds=1)
+
+        self.assertEqual(rc, 2)
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary["st"], "failed")
+        err = summary["err"][0]
+        self.assertEqual(err["st"], "timeout")
+        self.assertEqual(err["code"], 124)
+        self.assertIn("stdout", err)
+        self.assertIn("stderr", err)
+        self.assertEqual(ReviewState.load(self.review_dir).data["slices"]["api"]["runs"][0]["status"], "timeout")
+
     def test_quiet_slice_completes(self) -> None:
         self.add_slice("api")
         out = io.StringIO()
-        run_reviews(self.review_dir, command_runner=_writes("No actionable issues found."), stdout=out)
+        rc, summary = run_reviews(self.review_dir, command_runner=_writes("No actionable issues found."), stdout=out)
 
         state = ReviewState.load(self.review_dir)
+        self.assertEqual(rc, 0)
+        self.assertEqual(summary["st"], "done")
         self.assertTrue(state.data["slices"]["api"]["complete"])
         self.assertRegex(
             _single_review_file(self.review_dir, "*-1-api.md").name,
             TIMESTAMPED_REVIEW_FILE_RE,
         )
-        self.assertIn("done:", out.getvalue())
+        self.assertEqual(out.getvalue(), "")
 
     def test_finding_slice_advances_pass_number(self) -> None:
         self.add_slice("api")
@@ -586,7 +723,7 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             if errors:
                 raise errors[0]
-            self.assertEqual(results, [0])
+            self.assertEqual([rc for rc, _summary in results], [0])
         finally:
             slow_can_finish.set()
             thread.join(timeout=2)
@@ -656,8 +793,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(state.data["slices"]["api"]["runs"][0]["ignored_count"], 2)
 
         out = io.StringIO()
-        run_reviews(self.review_dir, command_runner=_should_not_run, stdout=out)
-        self.assertIn("done:", out.getvalue())
+        rc, summary = run_reviews(self.review_dir, command_runner=_should_not_run, stdout=out)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(summary["st"], "no_work")
 
     def test_ignored_report_without_slice_requires_unambiguous_run(self) -> None:
         self.add_slice("api")
@@ -902,11 +1041,48 @@ class RunnerTests(unittest.TestCase):
                 for _ in range(2)
             ]
             for future in futures:
-                self.assertEqual(future.result(timeout=5), 0)
+                rc, _summary = future.result(timeout=5)
+                self.assertEqual(rc, 0)
 
         self.assertEqual(calls, ["api"])
         state = ReviewState.load(self.review_dir)
         self.assertEqual(len(state.data["slices"]["api"]["runs"]), 1)
+
+    def test_waited_concurrent_failure_is_reported(self) -> None:
+        self.add_slice("api")
+        started = threading.Event()
+        release = threading.Event()
+        first_result: list[tuple[int, dict]] = []
+
+        def failing_runner(cmd, cwd, input_text, output_file, slice_data):
+            started.set()
+            release.wait(timeout=2)
+            return subprocess.CompletedProcess(cmd, 1, "failed stdout", "failed stderr")
+
+        thread = threading.Thread(
+            target=lambda: first_result.append(run_reviews(self.review_dir, command_runner=failing_runner, stdout=io.StringIO()))
+        )
+        thread.start()
+        self.assertTrue(started.wait(timeout=2))
+        second_result: list[tuple[int, dict]] = []
+        second = threading.Thread(
+            target=lambda: second_result.append(run_reviews(self.review_dir, command_runner=_should_not_run, stdout=io.StringIO()))
+        )
+        second.start()
+        time.sleep(0.05)
+        release.set()
+        thread.join(timeout=2)
+        second.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(second.is_alive())
+        rc, summary = second_result[0]
+
+        self.assertEqual(rc, 2)
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary["st"], "failed")
+        self.assertEqual(summary["ran"], 0)
+        self.assertEqual(summary["err"][0]["s"], "api")
+        self.assertEqual(first_result[0][0], 2)
 
     def test_runner_builds_expected_native_command(self) -> None:
         self.add_slice("api")
@@ -1194,7 +1370,8 @@ class CliTests(unittest.TestCase):
                 str(bad_review_dir),
                 *([] if script == "run_reviews.py" else ["--count", "1"]),
             )
-            self.assertEqual(proc.returncode, 2)
+            expected_returncode = 1 if script == "run_reviews.py" else 2
+            self.assertEqual(proc.returncode, expected_returncode)
             self.assertIn("error:", proc.stderr)
             self.assertNotIn("Traceback", proc.stderr)
 
@@ -1417,6 +1594,286 @@ class CliTests(unittest.TestCase):
         state = ReviewState.load(review_dir)
         self.assertEqual(state.data["slices"]["api-prompt"]["mode"], "prompt")
         self.assertTrue(state.data["slices"]["api-prompt"]["complete"])
+
+    def test_run_reviews_cli_no_stdout_summary_file_and_stream_progress_flags(self) -> None:
+        fake_bin = Path(self.tmp.name) / "barrier-bin"
+        fake_bin.mkdir()
+        fake_codex = fake_bin / "codex"
+        fake_codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, time\n"
+            "sys.stdout.write('CHILD STDOUT\\n')\n"
+            "sys.stderr.write('CHILD STDERR\\n')\n"
+            "time.sleep(0.05)\n"
+            "out = sys.argv[sys.argv.index('-o') + 1]\n"
+            "open(out, 'w', encoding='utf-8').write('No findings.')\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        env = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"}
+
+        review_dir = Path(
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review quiet CLI barrier.",
+            ).stdout.strip()
+        )
+        add = self.run_cli(str(SCRIPTS / "add_slice.py"), "--review-dir", str(review_dir), "--name", "api", "--uncommitted")
+        self.assertEqual(add.returncode, 0, add.stderr)
+        summary_path = review_dir / "_last-run.json"
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "run_reviews.py"),
+                "--review-dir",
+                str(review_dir),
+                "--summary-json",
+                str(summary_path),
+                "--no-stdout",
+            ],
+            cwd=self.root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(proc.stderr, "")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["st"], "done")
+        self.assertNotIn("CHILD STDOUT", json.dumps(summary))
+        self.assertNotIn("CHILD STDERR", json.dumps(summary))
+        success_stdout_logs = sorted((review_dir / "_logs").glob("*.stdout.log"))
+        success_stderr_logs = sorted((review_dir / "_logs").glob("*.stderr.log"))
+        self.assertEqual(len(success_stdout_logs), 1)
+        self.assertEqual(len(success_stderr_logs), 1)
+        self.assertIn("CHILD STDOUT", success_stdout_logs[0].read_text(encoding="utf-8"))
+        self.assertIn("CHILD STDERR", success_stderr_logs[0].read_text(encoding="utf-8"))
+
+        no_work = subprocess.run(
+            [sys.executable, str(SCRIPTS / "run_reviews.py"), "--review-dir", str(review_dir)],
+            cwd=self.root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(no_work.returncode, 0, no_work.stderr)
+        self.assertEqual(no_work.stderr, "")
+        no_work_summary = json.loads(no_work.stdout)
+        self.assertEqual(no_work_summary["st"], "no_work")
+        self.assertEqual(no_work_summary["ran"], 0)
+
+        default_review_dir = Path(
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review default CLI JSON.",
+            ).stdout.strip()
+        )
+        add_default = self.run_cli(
+            str(SCRIPTS / "add_slice.py"),
+            "--review-dir",
+            str(default_review_dir),
+            "--name",
+            "api",
+            "--uncommitted",
+        )
+        self.assertEqual(add_default.returncode, 0, add_default.stderr)
+        default_proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "run_reviews.py"), "--review-dir", str(default_review_dir)],
+            cwd=self.root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(default_proc.returncode, 0, default_proc.stderr)
+        self.assertEqual(default_proc.stderr, "")
+        self.assertEqual(default_proc.stdout.count("\n"), 1)
+        default_summary = json.loads(default_proc.stdout)
+        self.assertEqual(default_summary["st"], "done")
+        self.assertEqual(default_summary["ran"], 1)
+        self.assertNotIn("CHILD STDOUT", default_proc.stdout)
+        self.assertEqual(
+            json.loads((default_review_dir / "_last-run.json").read_text(encoding="utf-8")),
+            default_summary,
+        )
+
+        fail_bin = Path(self.tmp.name) / "barrier-fail-bin"
+        fail_bin.mkdir()
+        fail_codex = fail_bin / "codex"
+        fail_codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdout.write('FAILED CHILD STDOUT\\n')\n"
+            "sys.stderr.write('FAILED CHILD STDERR\\n')\n"
+            "sys.exit(7)\n",
+            encoding="utf-8",
+        )
+        fail_codex.chmod(0o755)
+        fail_env = {**os.environ, "PATH": f"{fail_bin}{os.pathsep}{os.environ['PATH']}"}
+        fail_review_dir = Path(
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review failed CLI logging.",
+            ).stdout.strip()
+        )
+        add_fail = self.run_cli(
+            str(SCRIPTS / "add_slice.py"),
+            "--review-dir",
+            str(fail_review_dir),
+            "--name",
+            "api",
+            "--uncommitted",
+        )
+        self.assertEqual(add_fail.returncode, 0, add_fail.stderr)
+        fail_summary_path = fail_review_dir / "_last-run.json"
+        fail_proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "run_reviews.py"),
+                "--review-dir",
+                str(fail_review_dir),
+                "--summary-json",
+                str(fail_summary_path),
+                "--no-stdout",
+            ],
+            cwd=self.root,
+            env=fail_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(fail_proc.returncode, 2)
+        self.assertEqual(fail_proc.stdout, "")
+        self.assertEqual(fail_proc.stderr, "")
+        fail_summary = json.loads(fail_summary_path.read_text(encoding="utf-8"))
+        fail_err = fail_summary["err"][0]
+        stdout_log = self.root / fail_err["stdout"]
+        stderr_log = self.root / fail_err["stderr"]
+        self.assertIn("FAILED CHILD STDOUT", stdout_log.read_text(encoding="utf-8"))
+        self.assertIn("FAILED CHILD STDERR", stderr_log.read_text(encoding="utf-8"))
+        self.assertNotIn("FAILED CHILD STDOUT", json.dumps(fail_summary))
+        self.assertNotIn("FAILED CHILD STDERR", json.dumps(fail_summary))
+
+        default_fail_review_dir = Path(
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review failed default CLI logging.",
+            ).stdout.strip()
+        )
+        add_default_fail = self.run_cli(
+            str(SCRIPTS / "add_slice.py"),
+            "--review-dir",
+            str(default_fail_review_dir),
+            "--name",
+            "api",
+            "--uncommitted",
+        )
+        self.assertEqual(add_default_fail.returncode, 0, add_default_fail.stderr)
+        default_fail_proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "run_reviews.py"), "--review-dir", str(default_fail_review_dir)],
+            cwd=self.root,
+            env=fail_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(default_fail_proc.returncode, 2)
+        self.assertEqual(default_fail_proc.stderr, "")
+        default_fail_summary = json.loads(default_fail_proc.stdout)
+        self.assertFalse(default_fail_summary["ok"])
+        self.assertEqual(
+            json.loads((default_fail_review_dir / "_last-run.json").read_text(encoding="utf-8")),
+            default_fail_summary,
+        )
+        self.assertNotIn("FAILED CHILD STDOUT", default_fail_proc.stdout)
+        self.assertNotIn("FAILED CHILD STDERR", default_fail_proc.stdout)
+
+        invalid = self.run_cli(
+            str(SCRIPTS / "run_reviews.py"),
+            "--review-dir",
+            str(review_dir),
+            "--summary-json",
+            str(summary_path),
+            "--no-stdout",
+            "--stream-progress",
+        )
+        self.assertEqual(invalid.returncode, 1)
+        self.assertIn("incompatible", invalid.stderr)
+
+        stream_review_dir = Path(
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review stream progress opt-in.",
+            ).stdout.strip()
+        )
+        add_stream = self.run_cli(
+            str(SCRIPTS / "add_slice.py"),
+            "--review-dir",
+            str(stream_review_dir),
+            "--name",
+            "api",
+            "--uncommitted",
+        )
+        self.assertEqual(add_stream.returncode, 0, add_stream.stderr)
+        stream_proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "run_reviews.py"), "--review-dir", str(stream_review_dir), "--stream-progress"],
+            cwd=self.root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(stream_proc.returncode, 0, stream_proc.stderr)
+        self.assertIn("api: pass 1", stream_proc.stderr)
+        self.assertEqual(json.loads(stream_proc.stdout)["st"], "done")
+        self.assertNotIn("CHILD STDOUT", stream_proc.stdout)
+        self.assertNotIn("CHILD STDERR", stream_proc.stderr)
+
+    def test_skill_documents_review_barrier_protocol(self) -> None:
+        text = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("## Review Barrier Protocol", text)
+        self.assertIn('python3 "$SKILL_DIR/scripts/run_reviews.py" --review-dir "$REVIEW_DIR"', text)
+        self.assertNotIn("--summary-json", text)
+        self.assertNotIn("--no-stdout", text)
+        self.assertNotIn("--stream-progress", text)
+        self.assertNotIn("_last-run.json", text)
+        self.assertIn("Do not run it with `&`, `nohup`, `disown`, `tmux`, `screen`", text)
+        self.assertIn("2 hours / 7,200,000 ms", text)
+        self.assertNotIn("Keep calling it until it prints `done`", text)
+
+    def test_readme_documents_human_recovery_and_debug_options(self) -> None:
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("_last-run.json", text)
+        self.assertIn("recovery path", text)
+        self.assertIn("--stream-progress", text)
+        self.assertIn("local human debugging", text)
 
 
 def _writes(text: str):
