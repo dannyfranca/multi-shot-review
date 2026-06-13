@@ -497,6 +497,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(summary["ran"], 2)
         self.assertEqual(summary["rem"], 0)
         self.assertEqual(results[0][1], summary)
+        self.assertEqual(json.loads((self.review_dir / "_last-run.json").read_text(encoding="utf-8")), summary)
+        self.assertFalse(any(path.name.startswith("._last-run.json") for path in self.review_dir.iterdir()))
 
     def test_summary_json_no_stdout_writes_atomic_summary(self) -> None:
         self.add_slice("api")
@@ -555,6 +557,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(summary["ran"], 0)
         self.assertEqual(summary["out"], [])
         self.assertIsNone(summary["err"])
+        self.assertEqual(json.loads((self.review_dir / "_last-run.json").read_text(encoding="utf-8")), summary)
 
     def test_child_timeout_marks_attempt_failed_with_log_paths(self) -> None:
         self.add_slice("api")
@@ -1704,6 +1707,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(default_summary["st"], "done")
         self.assertEqual(default_summary["ran"], 1)
         self.assertNotIn("CHILD STDOUT", default_proc.stdout)
+        self.assertEqual(
+            json.loads((default_review_dir / "_last-run.json").read_text(encoding="utf-8")),
+            default_summary,
+        )
 
         fail_bin = Path(self.tmp.name) / "barrier-fail-bin"
         fail_bin.mkdir()
@@ -1766,6 +1773,44 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("FAILED CHILD STDOUT", json.dumps(fail_summary))
         self.assertNotIn("FAILED CHILD STDERR", json.dumps(fail_summary))
 
+        default_fail_review_dir = Path(
+            self.run_cli(
+                str(SCRIPTS / "init_state.py"),
+                "--root",
+                str(self.root),
+                "--task",
+                "Review failed default CLI logging.",
+            ).stdout.strip()
+        )
+        add_default_fail = self.run_cli(
+            str(SCRIPTS / "add_slice.py"),
+            "--review-dir",
+            str(default_fail_review_dir),
+            "--name",
+            "api",
+            "--uncommitted",
+        )
+        self.assertEqual(add_default_fail.returncode, 0, add_default_fail.stderr)
+        default_fail_proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "run_reviews.py"), "--review-dir", str(default_fail_review_dir)],
+            cwd=self.root,
+            env=fail_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(default_fail_proc.returncode, 2)
+        self.assertEqual(default_fail_proc.stderr, "")
+        default_fail_summary = json.loads(default_fail_proc.stdout)
+        self.assertFalse(default_fail_summary["ok"])
+        self.assertEqual(
+            json.loads((default_fail_review_dir / "_last-run.json").read_text(encoding="utf-8")),
+            default_fail_summary,
+        )
+        self.assertNotIn("FAILED CHILD STDOUT", default_fail_proc.stdout)
+        self.assertNotIn("FAILED CHILD STDERR", default_fail_proc.stdout)
+
         invalid = self.run_cli(
             str(SCRIPTS / "run_reviews.py"),
             "--review-dir",
@@ -1814,8 +1859,9 @@ class CliTests(unittest.TestCase):
     def test_skill_documents_review_barrier_protocol(self) -> None:
         text = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("## Review Barrier Protocol", text)
-        self.assertIn("--summary-json", text)
-        self.assertIn("--no-stdout", text)
+        self.assertIn('python3 "$SKILL_DIR/scripts/run_reviews.py" --review-dir "$REVIEW_DIR"', text)
+        self.assertNotIn("--summary-json", text)
+        self.assertNotIn("--no-stdout", text)
         self.assertIn("Do not run it with `&`, `nohup`, `disown`, `tmux`, `screen`", text)
         self.assertIn("2 hours / 7,200,000 ms", text)
         self.assertNotIn("Keep calling it until it prints `done`", text)

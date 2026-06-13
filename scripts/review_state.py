@@ -1251,14 +1251,19 @@ def write_summary_json(path: Path, summary: dict[str, Any], *, pretty: bool = Fa
 def _emit_summary(
     summary: dict[str, Any],
     *,
+    review_dir: Path,
     summary_json: Path | None,
     no_stdout: bool,
     stdout_json: bool,
     stdout: Any,
     pretty_json: bool,
 ) -> None:
+    default_summary_json = review_dir / "_last-run.json"
+    write_summary_json(default_summary_json, summary, pretty=pretty_json)
     if summary_json is not None:
-        write_summary_json(summary_json, summary, pretty=pretty_json)
+        requested_summary_json = summary_json.resolve()
+        if requested_summary_json != default_summary_json.resolve():
+            write_summary_json(requested_summary_json, summary, pretty=pretty_json)
     if stdout_json and not no_stdout:
         stdout.write(compact_summary_json(summary, pretty=pretty_json) + "\n")
         stdout.flush()
@@ -1353,7 +1358,15 @@ def run_reviews(
             out_records=waited_out,
             err_records=waited_errors,
         )
-        _emit_summary(summary, summary_json=summary_json, no_stdout=no_stdout, stdout_json=stdout_json, stdout=stdout, pretty_json=pretty_json)
+        _emit_summary(
+            summary,
+            review_dir=review_dir,
+            summary_json=summary_json,
+            no_stdout=no_stdout,
+            stdout_json=stdout_json,
+            stdout=stdout,
+            pretty_json=pretty_json,
+        )
         return (0 if ok else 2), summary
 
     out_records: list[dict[str, Any]] = []
@@ -1450,7 +1463,15 @@ def run_reviews(
         out_records=out_records,
         err_records=err_records,
     )
-    _emit_summary(summary, summary_json=summary_json, no_stdout=no_stdout, stdout_json=stdout_json, stdout=stdout, pretty_json=pretty_json)
+    _emit_summary(
+        summary,
+        review_dir=review_dir,
+        summary_json=summary_json,
+        no_stdout=no_stdout,
+        stdout_json=stdout_json,
+        stdout=stdout,
+        pretty_json=pretty_json,
+    )
     return rc, summary
 
 
