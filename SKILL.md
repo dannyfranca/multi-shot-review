@@ -118,6 +118,7 @@ After the command exits, read only:
 
 ## Guardrails
 
+- Prefer `gpt-5.6-sol` with high reasoning for review slices. Use `--model` only when a slice needs an explicit override.
 - The scripts own state, locking, output names, retry behavior, and deciding whether another pass is needed.
 - Do not manually skip follow-up passes when the summary says work remains.
 - Do not manually edit task-context paths in prompts. Initialize with the original user request and use `add_related_task.py`; the runner attaches `$REVIEW_DIR/task.md` consistently.

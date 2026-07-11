@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable
 
 
 SCHEMA_VERSION = 1
-DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING = "high"
 TASK_ENTRYPOINT = "task.md"
 RELATED_TASKS_DIR = "related-tasks"

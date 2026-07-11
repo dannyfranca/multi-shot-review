@@ -1097,7 +1097,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(slice_data["target"], {"uncommitted": True})
             self.assertEqual(cmd[:4], ["codex", "exec", "review", "--ephemeral"])
             self.assertIn("-m", cmd)
-            self.assertEqual(cmd[cmd.index("-m") + 1], "gpt-5.5")
+            self.assertEqual(cmd[cmd.index("-m") + 1], "gpt-5.6-sol")
             self.assertIn('-c', cmd)
             self.assertEqual(cmd[cmd.index("-c") + 1], 'model_reasoning_effort="high"')
             self.assertIn("--uncommitted", cmd)
