@@ -1,4 +1,4 @@
-> **Deprecated** Use instead: https://github.com/dannyfranca/skills/tree/main/skills/multi-shot-review
+> **Deprecated**. Use instead: https://github.com/dannyfranca/skills/tree/main/skills/multi-shot-review
 
 # multi-shot-review
 
