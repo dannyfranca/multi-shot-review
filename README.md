@@ -1,3 +1,5 @@
+> **Deprecated** Use instead: https://github.com/dannyfranca/skills/tree/main/skills/multi-shot-review
+
 # multi-shot-review
 
 `multi-shot-review` runs repeated Codex review slices against a change and keeps state under a `.review/...` directory.
